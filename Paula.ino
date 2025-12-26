@@ -677,7 +677,7 @@ if (loraReceived) {
     uint8_t green = 255;
     uint8_t blue = 255;
 
-        if (chinampaData.sumpTroughMeasuredHeight >=(chinampaData.maximumSumpTroughLevel - chinampaData.minimumSumpTroughLevel) )
+        if (chinampaData.sumpTroughMeasuredHeight >=(chinampaData.sumpTroughHeight - chinampaData.minimumSumpTroughLevel) )
           {
             red = 255;
             green = 0;
@@ -707,11 +707,11 @@ if (loraReceived) {
 
       
       display.print("Mi:");
-      display.print((int)digitalStablesData.troughlevelminimumcm);
+      display.print((int)chinampaData.minimumSumpTroughLevel);
       display.print(" Ma:");
-      display.print((int)digitalStablesData.troughlevelmaximumcm);
+      display.print((int)chinampaData.maximumSumpTroughLevel);
       display.print(" TH: ");
-      display.println((int)digitalStablesData.maximumScepticHeight);
+      display.println((int)chinampaData.sumpTroughHeight);
        display.display();
   
 
