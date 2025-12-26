@@ -258,7 +258,14 @@ if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
   currentTimerRecord = timeManager.now();
  timeManager.printTimeToSerial(currentTimerRecord);
  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
- performLedShow(ledShowDuration);
+ //performLedShow(ledShowDuration);
+
+ for (int i = 0; i < NUM_LEDS; i++) {
+    leds[i] = CRGB(255, 255, 0);
+  }
+
+ 
+  FastLED.show();
 
    //
   // lora code
@@ -276,12 +283,7 @@ if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
   delay(50);
 
   
-  for (int i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CRGB(0, 0, 0);
-  }
-  leds[0] = CRGB(255, 255, 0);
  
-  FastLED.show();
 
 
   if (!LoRa.begin(433E6)) {
@@ -324,16 +326,20 @@ delay(1000);
   //pinMode(18, OUTPUT);  // Reconfigure as regular GPIO
   //pinMode(5, OUTPUT);   // Also set pin 5
 
- xTaskCreatePinnedToCore(
-        ledShowTaskFunction,    // Task function
-        "ledShowTask",          // Name of task
-        5000,                   // Stack size
-        NULL,                   // Parameter
-        1,                      // Priority
-        &ledShowTask,          // Task handle
-        0                      // Core ID (0)
-    );
-   runLedShow = true;
+//  xTaskCreatePinnedToCore(
+//         ledShowTaskFunction,    // Task function
+//         "ledShowTask",          // Name of task
+//         5000,                   // Stack size
+//         NULL,                   // Parameter
+//         1,                      // Priority
+//         &ledShowTask,          // Task handle
+//         0                      // Core ID (0)
+//     );
+//    runLedShow = true;
+ leds[1] = CRGB(0, 0, 0);
+
+ leds[2] = CRGB(0, 0, 0);
+ FastLED.show();
    Serial.println("finished setup");
 }
 
@@ -414,7 +420,8 @@ if (loraReceived) {
 
     }else if (loraPacketSize == sizeof(SeedlingMonitorData)) {
     
-     
+       leds[2] = CRGB(0, 0, 0);
+      FastLED.show();
      display.clearDisplay();
       centerText(seedlingMonitorData.devicename, 0);
 
@@ -423,19 +430,25 @@ if (loraReceived) {
        float rssi = seedlingMonitorData.rssi;
        float snr = seedlingMonitorData.snr;
       display.print("rssi: ");
-      display.print(rssi);
+      display.print((int)rssi);
       display.print(" snr: ");
       display.println(snr);
       display.display();
 
      if(rssi<-100 && rssi>-120){
         leds[3] = CRGB(255, 0, 0);
+        Serial.println("line 435");
       }else if(rssi<=-90 && rssi>=-100){
         leds[3] = CRGB(255, 255, 0);
+        Serial.println("line 438");
       }else if(rssi<=-70 && rssi>=-90){
         leds[3] = CRGB(0, 255, 0);
+        Serial.println("line 441");
+ 
       }else if(rssi<=-30 && rssi>=-70){
         leds[3] = CRGB(0, 0, 255);
+        Serial.println("line 445");
+ 
       }
      
       
@@ -453,7 +466,8 @@ if (loraReceived) {
     }else if (loraPacketSize == sizeof(GloriaTankFlowPumpData)) {
       
     } else if (loraPacketSize == sizeof(DigitalStablesData)) {
-     
+     leds[2] = CRGB(0, 0, 0);
+      FastLED.show();
       //if(debug)
       if(debug)Serial.print("line 462, received from ");
       //if(debug)
@@ -470,25 +484,74 @@ if (loraReceived) {
        float rssi = digitalStablesData.rssi;
        float snr = digitalStablesData.snr;
       display.print("rssi:");
-      display.print(rssi);
+      display.print((int)rssi);
       display.print(" snr:");
       display.println(snr);
-      display.print("Height: ");
-      display.println(digitalStablesData.measuredHeight);
+      display.print("H: ");
+      display.print(digitalStablesData.measuredHeight);
+      uint8_t red = 255;
+    uint8_t green = 255;
+    uint8_t blue = 255;
+
+        if (digitalStablesData.measuredHeight >=(digitalStablesData.maximumScepticHeight - digitalStablesData.troughlevelminimumcm) )
+          {
+            red = 255;
+            green = 0;
+            blue = 0;
+            display.println("  Red");
+          }
+          else if (digitalStablesData.measuredHeight < (digitalStablesData.maximumScepticHeight - digitalStablesData.troughlevelminimumcm) && digitalStablesData.measuredHeight >= (digitalStablesData.maximumScepticHeight - digitalStablesData.troughlevelmaximumcm))
+          {
+            red = 0;
+            green = 255;
+            blue = 0;
+            display.println("  Green");
+          }
+          else if (digitalStablesData.measuredHeight < (digitalStablesData.maximumScepticHeight - digitalStablesData.troughlevelmaximumcm))
+          {
+            red = 0;
+            green = 0;
+            blue = 255;
+            display.println("  Blue");
+          }
+
+          leds[1] = CRGB(red, green, blue);
+          FastLED.show();
+
+
+
+
+      
+      display.print("Mi:");
+      display.print((int)digitalStablesData.troughlevelminimumcm);
+      display.print(" Ma:");
+      display.print((int)digitalStablesData.troughlevelmaximumcm);
+      display.print(" TH: ");
+      display.println((int)digitalStablesData.maximumScepticHeight);
+      
+
       display.print("u Temp: ");
       display.print(digitalStablesData.temperature);
       display.display();
   
       if(rssi<-100 ){
         leds[3] = CRGB(255, 0, 0);
+               Serial.println("line 491");
+ 
       }else if(rssi<=-90 && rssi>=-100){
         leds[3] = CRGB(255, 255, 0);
+               Serial.println("line 496");
+ 
       }else if(rssi<=-70 && rssi>=-90){
         leds[3] = CRGB(0, 255, 0);
+               Serial.println("line 500");
+ 
       }else if(rssi<=-30 && rssi>=-70){
         leds[3] = CRGB(0, 0, 255);
+               Serial.println("line 504");
+ 
       }
-     
+      FastLED.show();
       
        if(snr<-10 ){
         leds[4] = CRGB(255, 0, 0);
@@ -522,8 +585,28 @@ if (loraReceived) {
       centerText(chinampaData.devicename, 0);
 
       display.setTextSize(1);  // Switch to smaller text
-      display.setCursor(0, 20);  // x=0 (left), y=20 (below title)'
+      display.setCursor(0, 10);  // x=0 (left), y=20 (below title)'
+      if(chinampaData.alertstatus){
+         leds[2] = CRGB(255, 0, 0);
 
+         display.print("Alrt:");
+         if(chinampaData.alertcode==1){
+            display.println("Fish Tank Data Stale");
+         }else if(chinampaData.alertcode==2){
+            display.println("Sump Stale");
+         }else if(chinampaData.alertcode==3){
+            display.println("Fish & Sump Stale");
+         }else if(chinampaData.alertcode==4){
+            display.println("Fish flow<2");
+         }else if(chinampaData.alertcode==5){
+            display.println("Sump too low");
+         }else if(chinampaData.alertcode==10){
+            display.println("uTemp high");
+         }
+      }else{
+        leds[2] = CRGB(0, 0, 0);
+      }
+      FastLED.show();
 // line 2
       display.print("Pump: ");
       if(chinampaData.pumprelaystatus){
@@ -533,32 +616,32 @@ if (loraReceived) {
       }
 
       // line 3
-      display.print("Fish Sol: ");
+      display.print("Fish Sol:");
       if(chinampaData.fishtankoutflowsolenoidrelaystatus){
-         display.println("Open");
+         display.print("1");
       }else{
-        display.println("Closed");
+        display.print("0");
       }
-      //line 4
-      display.print("Fish Flow: ");
+      //
+      display.print(" Flow:");
        display.println(chinampaData.fishtankoutflowflowRate);
      
 
       
-
+      // line 4
        float rssi = chinampaData.rssi;
        float snr = chinampaData.snr;
       display.print("rssi:");
-      display.print(rssi);
+      display.print((int)rssi);
       display.print(" snr:");
       display.println(snr);
       
-      display.print("u Temperature:");
-      display.println(chinampaData.microtemperature);
-      display.print("RTC Bat Volt:");
-      display.println(chinampaData.rtcBatVolt);
-      display.display();
-  
+      display.print("uT:");
+      display.print(chinampaData.microtemperature);
+      display.print(" RTC:");
+      display.print(chinampaData.rtcBatVolt);
+      display.println("V");
+     
       if(rssi<-100 ){
         leds[3] = CRGB(255, 0, 0);
       }else if(rssi<=-90 && rssi>=-100){
@@ -568,7 +651,7 @@ if (loraReceived) {
       }else if(rssi<=-30 && rssi>=-70){
         leds[3] = CRGB(0, 0, 255);
       }
-     
+      FastLED.show();
       
        if(snr<-10 ){
         leds[4] = CRGB(255, 0, 0);
@@ -584,7 +667,54 @@ if (loraReceived) {
       Serial.print(chinampaData.rssi);
       Serial.print("  snr=");
       Serial.println(chinampaData.snr);
+      //
+      // line 5 sump
+      //
+
+      display.print("SH: ");
+      display.print(chinampaData.sumpTroughMeasuredHeight);
+      uint8_t red = 255;
+    uint8_t green = 255;
+    uint8_t blue = 255;
+
+        if (chinampaData.sumpTroughMeasuredHeight >=(chinampaData.maximumSumpTroughLevel - chinampaData.minimumSumpTroughLevel) )
+          {
+            red = 255;
+            green = 0;
+            blue = 0;
+            display.println("  Red");
+          } 
+          else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.minimumSumpTroughLevel) && chinampaData.sumpTroughMeasuredHeight >= (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel))
+          {
+            red = 0;
+            green = 255;
+            blue = 0;
+            display.println("  Green");
+          }
+          else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel))
+          {
+            red = 0;
+            green = 0;
+            blue = 255;
+            display.println("  Blue");
+          }
+
+          leds[1] = CRGB(red, green, blue);
+          FastLED.show();
+
+
+
+
       
+      display.print("Mi:");
+      display.print((int)digitalStablesData.troughlevelminimumcm);
+      display.print(" Ma:");
+      display.print((int)digitalStablesData.troughlevelmaximumcm);
+      display.print(" TH: ");
+      display.println((int)digitalStablesData.maximumScepticHeight);
+       display.display();
+  
+
       //  delay(500);
     }else if (loraPacketSize > 0) {
       display.clearDisplay();
