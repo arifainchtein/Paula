@@ -43,7 +43,7 @@ const int SWITCH_PIN_RIGHT = 33;  // Connected to Pin 3
 
 RTCInfoRecord currentTimerRecord;
 #define TIME_RECORD_REFRESH_SECONDS 3
-
+bool switchPositionLeft=true;
 volatile bool clockTicked = false;
 volatile bool lowVoltageAlert = false;
 int lastLoraReceptionSeconds=0;
@@ -63,6 +63,9 @@ DigitalStablesData digitalStablesData;
 SeedlingMonitorData seedlingMonitorData;
 GloriaTankFlowPumpData gloriaTankFlowPumpData;
 ChinampaData chinampaData;
+boolean displayingChinampa=true;
+uint8_t chinampaPageToDisplay=0;
+bool refreshChinampaPage=false;
 
 #define RTC_CLK_OUT 4
 bool loraActive = false;
@@ -258,7 +261,7 @@ if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
   currentTimerRecord = timeManager.now();
  timeManager.printTimeToSerial(currentTimerRecord);
  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
- //performLedShow(ledShowDuration);
+ FastLED.setBrightness(10);  
 
  for (int i = 0; i < NUM_LEDS; i++) {
     leds[i] = CRGB(255, 255, 0);
@@ -364,6 +367,99 @@ void centerText(String text, int y) {
   display.print(text);
 }
 
+void showChinampaPage1(){
+  display.clearDisplay();
+    centerText(chinampaData.devicename, 0);
+
+    display.setTextSize(1);  // Switch to smaller text
+    display.setCursor(0, 10);  // x=0 (left), y=20 (below title)'
+    if(chinampaData.alertstatus){
+        leds[2] = CRGB(255, 0, 0);
+        display.print("Alrt:");
+        if(chinampaData.alertcode==1){
+          display.println("Fish Tank Data Stale");
+        }else if(chinampaData.alertcode==2){
+          display.println("Sump Stale");
+        }else if(chinampaData.alertcode==3){
+          display.println("Fish & Sump Stale");
+        }else if(chinampaData.alertcode==4){
+          display.println("Fish flow<2");
+        }else if(chinampaData.alertcode==5){
+          display.println("Sump too low");
+        }else if(chinampaData.alertcode==10){
+          display.println("uTemp high");
+        }
+    }else{
+      leds[2] = CRGB(0, 0, 0);
+    }
+    FastLED.show();
+// line 2
+    display.print("Pump: ");
+    if(chinampaData.pumprelaystatus){
+        display.println("ON");
+    }else{
+      display.print("OFF");
+    }
+
+    display.print(" FS: ");
+    if(chinampaData.fishtankoutflowsolenoidrelaystatus){
+        display.println("OPEN");
+    }else{
+      display.println("CLOSE");
+    }
+
+    // line 3
+    display.print("F Last:");
+    display.print(chinampaData.secondsSinceLastFishTankData);
+    
+    //
+    display.print(" Flow:");
+    display.println(chinampaData.fishtankoutflowflowRate);
+    
+    display.print("S H:");
+    display.print((int)chinampaData.sumpTroughMeasuredHeight);
+    display.print(" L:");
+    display.print(chinampaData.secondsSinceLastSumpTroughData);
+    display.print("Mi:");
+    display.print((int)chinampaData.minimumSumpTroughLevel);
+    display.print(" Ma:");
+    display.print((int)chinampaData.maximumSumpTroughLevel);
+    display.print(" TH:");
+    display.println((int)chinampaData.sumpTroughHeight);
+      
+
+    display.print("uT:");
+    display.print(chinampaData.microtemperature);
+    display.print(" RTC:");
+    display.print(chinampaData.rtcBatVolt);
+    display.println("V");
+    display.display();
+}
+
+void showChinampaPage2(){
+  float rssi = chinampaData.rssi;
+  float snr = chinampaData.snr;
+  display.print("rssi:");
+  display.print((int)rssi);
+  display.print(" snr:");
+  display.println(snr);
+  if(chinampaData.sensorstatus[0]){
+    display.println("uTemp high");
+  }else{
+    display.println("uTemp ok");
+  }
+  if(chinampaData.sensorstatus[1]){
+    display.println("Fish Tank Change>10%");
+  }else{
+    display.println("Fish Tank Ok");
+  }
+  if(chinampaData.sensorstatus[2]){
+    display.println("Sump Height Change>10%");
+  }else{
+    display.println("Sump Height Ok");
+  }
+  display.display();
+}
 
 void loop() {
   // put your main code here, to run repeatedly:
@@ -375,24 +471,41 @@ void loop() {
     portEXIT_CRITICAL(&mux);
     currentTimerRecord = timeManager.now();
     lastLoraReceptionSeconds++;
-     int left = digitalRead(SWITCH_PIN_LEFT);
-  int right = digitalRead(SWITCH_PIN_RIGHT);
-   
+    int left = digitalRead(SWITCH_PIN_LEFT);
+    int right = digitalRead(SWITCH_PIN_RIGHT);
 
-  if (left == LOW && right == HIGH) {
-  //  Serial.println("  Position: LEFT");
-  } 
-  else if (left == HIGH && right == LOW) {
-  //  Serial.println("  Position: RIGHT");
-  } 
-  else if (left == HIGH && right == HIGH) {
-  //  Serial.println("  Position: CENTER");
-  }
+    
+    
+    if (left == LOW && right == HIGH) {
+      Serial.println("  Position: LEFT");
+      if(switchPositionLeft){
+          // no change
+          refreshChinampaPage=false;
+      }else{
+        switchPositionLeft=false;
+        if(displayingChinampa)refreshChinampaPage=true;
+      }
+    }else if (left == HIGH && right == LOW) {
+      Serial.println("  Position: RIGHT");
+      if(switchPositionLeft){
+          // change
+          if(displayingChinampa)refreshChinampaPage=true;
+          switchPositionLeft=false;
+      }else{
+        refreshChinampaPage=false;
+      }
+    } 
+      
+    
   }
 
 
   
-  
+    if(refreshChinampaPage){
+      if(switchPositionLeft)showChinampaPage1();
+      else showChinampaPage2();
+      refreshChinampaPage=false;
+    }
   
 if(lastLoraReceptionSeconds>STALE_INTERVAL){
    leds[1] = CRGB(255, 0, 0);
@@ -420,49 +533,49 @@ if (loraReceived) {
 
     }else if (loraPacketSize == sizeof(SeedlingMonitorData)) {
     
-       leds[2] = CRGB(0, 0, 0);
-      FastLED.show();
-     display.clearDisplay();
-      centerText(seedlingMonitorData.devicename, 0);
+    //    leds[2] = CRGB(0, 0, 0);
+    //   FastLED.show();
+    //  display.clearDisplay();
+    //   centerText(seedlingMonitorData.devicename, 0);
 
-      display.setTextSize(1);  // Switch to smaller text
-      display.setCursor(0, 20);  // x=0 (left), y=20 (below title)
-       float rssi = seedlingMonitorData.rssi;
-       float snr = seedlingMonitorData.snr;
-      display.print("rssi: ");
-      display.print((int)rssi);
-      display.print(" snr: ");
-      display.println(snr);
-      display.display();
+    //   display.setTextSize(1);  // Switch to smaller text
+    //   display.setCursor(0, 20);  // x=0 (left), y=20 (below title)
+    //    float rssi = seedlingMonitorData.rssi;
+    //    float snr = seedlingMonitorData.snr;
+    //   display.print("rssi: ");
+    //   display.print((int)rssi);
+    //   display.print(" snr: ");
+    //   display.println(snr);
+    //   display.display();
 
-     if(rssi<-100 && rssi>-120){
-        leds[3] = CRGB(255, 0, 0);
-        Serial.println("line 435");
-      }else if(rssi<=-90 && rssi>=-100){
-        leds[3] = CRGB(255, 255, 0);
-        Serial.println("line 438");
-      }else if(rssi<=-70 && rssi>=-90){
-        leds[3] = CRGB(0, 255, 0);
-        Serial.println("line 441");
+    //  if(rssi<-100 && rssi>-120){
+    //     leds[3] = CRGB(255, 0, 0);
+    //     Serial.println("line 435");
+    //   }else if(rssi<=-90 && rssi>=-100){
+    //     leds[3] = CRGB(255, 255, 0);
+    //     Serial.println("line 438");
+    //   }else if(rssi<=-70 && rssi>=-90){
+    //     leds[3] = CRGB(0, 255, 0);
+    //     Serial.println("line 441");
  
-      }else if(rssi<=-30 && rssi>=-70){
-        leds[3] = CRGB(0, 0, 255);
-        Serial.println("line 445");
+    //   }else if(rssi<=-30 && rssi>=-70){
+    //     leds[3] = CRGB(0, 0, 255);
+    //     Serial.println("line 445");
  
-      }
+    //   }
      
       
-       if(snr<-10 ){
-        leds[4] = CRGB(255, 0, 0);
-      }else if(snr<=0 && snr>=-5){
-        leds[4] = CRGB(255, 255, 0);
-      }else if(snr>=0 && snr<=5){
-        leds[4] = CRGB(0, 255, 0);
-      }else if(snr>5){
-        leds[4] = CRGB(0, 0, 255);
-      }
+    //    if(snr<-10 ){
+    //     leds[4] = CRGB(255, 0, 0);
+    //   }else if(snr<=0 && snr>=-5){
+    //     leds[4] = CRGB(255, 255, 0);
+    //   }else if(snr>=0 && snr<=5){
+    //     leds[4] = CRGB(0, 255, 0);
+    //   }else if(snr>5){
+    //     leds[4] = CRGB(0, 0, 255);
+    //   }
      
-      FastLED.show();
+    //   FastLED.show();
     }else if (loraPacketSize == sizeof(GloriaTankFlowPumpData)) {
       
     } else if (loraPacketSize == sizeof(DigitalStablesData)) {
@@ -579,76 +692,19 @@ if (loraReceived) {
       
       //  delay(500);
     } else if (loraPacketSize == sizeof(ChinampaData)) {
+     displayingChinampa=true;
      
       //if(debug)
       if(debug)Serial.print("line 513, received from ");
       //if(debug)
       if(debug)Serial.println(chinampaData.devicename);
 
-     display.clearDisplay();
-      centerText(chinampaData.devicename, 0);
-
-      display.setTextSize(1);  // Switch to smaller text
-      display.setCursor(0, 10);  // x=0 (left), y=20 (below title)'
-      if(chinampaData.alertstatus){
-         leds[2] = CRGB(255, 0, 0);
-
-         display.print("Alrt:");
-         if(chinampaData.alertcode==1){
-            display.println("Fish Tank Data Stale");
-         }else if(chinampaData.alertcode==2){
-            display.println("Sump Stale");
-         }else if(chinampaData.alertcode==3){
-            display.println("Fish & Sump Stale");
-         }else if(chinampaData.alertcode==4){
-            display.println("Fish flow<2");
-         }else if(chinampaData.alertcode==5){
-            display.println("Sump too low");
-         }else if(chinampaData.alertcode==10){
-            display.println("uTemp high");
-         }
-      }else{
-        leds[2] = CRGB(0, 0, 0);
-      }
-      FastLED.show();
-// line 2
-      display.print("Pump: ");
-      if(chinampaData.pumprelaystatus){
-         display.println("ON");
-      }else{
-        display.println("OFF");
-      }
-
-      display.print(" FS: ");
-      if(chinampaData.fishtankoutflowsolenoidrelaystatus){
-         display.println("OPEN");
-      }else{
-        display.println("CLOSE");
-      }
-
-      // line 3
-      display.print("F Last:");
-      display.print(chinampaData.secondsSinceLastFishTankData);
-     
-      //
-      display.print(" Flow:");
-      display.println(chinampaData.fishtankoutflowflowRate);
-     
-
+     if(switchPositionLeft)showChinampaPage1();
+      else showChinampaPage2();
+       
       
-      // line 4
-       float rssi = chinampaData.rssi;
+      float rssi = chinampaData.rssi;
        float snr = chinampaData.snr;
-      display.print("rssi:");
-      display.print((int)rssi);
-      display.print(" snr:");
-      display.println(snr);
-      
-      display.print("uT:");
-      display.print(chinampaData.microtemperature);
-      display.print(" RTC:");
-      display.print(chinampaData.rtcBatVolt);
-      display.println("V");
      
       if(rssi<-100 ){
         leds[3] = CRGB(255, 0, 0);
@@ -679,8 +735,7 @@ if (loraReceived) {
       // line 5 sump
       //
 
-      display.print("SH: ");
-      display.print(chinampaData.sumpTroughMeasuredHeight);
+     
       uint8_t red = 255;
     uint8_t green = 255;
     uint8_t blue = 255;
@@ -690,14 +745,14 @@ if (loraReceived) {
             red = 255;
             green = 0;
             blue = 0;
-            display.println("  Red");
+            display.println(" Red");
           } 
           else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.minimumSumpTroughLevel) && chinampaData.sumpTroughMeasuredHeight >= (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel))
           {
             red = 0;
             green = 255;
             blue = 0;
-            display.println("  Green");
+            display.println(" Green");
           }
           else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel))
           {
@@ -707,21 +762,9 @@ if (loraReceived) {
             display.println("  Blue");
           }
 
+
           leds[1] = CRGB(red, green, blue);
           FastLED.show();
-
-
-
-
-      
-      display.print("Mi:");
-      display.print((int)chinampaData.minimumSumpTroughLevel);
-      display.print(" Ma:");
-      display.print((int)chinampaData.maximumSumpTroughLevel);
-      display.print(" TH: ");
-      display.println((int)chinampaData.sumpTroughHeight);
-       display.display();
-  
 
       //  delay(500);
     }else if (loraPacketSize > 0) {
