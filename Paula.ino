@@ -530,8 +530,12 @@ if (loraReceived) {
       display.println((int)digitalStablesData.maximumScepticHeight);
       
 
-      display.print("u Temp: ");
+      display.print("u Temp:");
       display.print(digitalStablesData.temperature);
+      display.print(" Out T:");
+      display.print(digitalStablesData.outdoortemperature);
+      
+
       display.display();
   
       if(rssi<-100 ){
@@ -615,16 +619,20 @@ if (loraReceived) {
         display.println("OFF");
       }
 
-      // line 3
-      display.print("Fish Sol:");
+      display.print(" FS: ");
       if(chinampaData.fishtankoutflowsolenoidrelaystatus){
-         display.print("1");
+         display.println("OPEN");
       }else{
-        display.print("0");
+        display.println("CLOSE");
       }
+
+      // line 3
+      display.print("F Last:");
+      display.print(chinampaData.secondsSinceLastFishTankData);
+     
       //
       display.print(" Flow:");
-       display.println(chinampaData.fishtankoutflowflowRate);
+      display.println(chinampaData.fishtankoutflowflowRate);
      
 
       
