@@ -147,7 +147,7 @@ void processLora(int packetSize) {
 
 
   if (packetSize == 0) return;  // if there's no packet, return
-  
+  displayingChinampa=false;
  Serial.println("received " +  String(packetSize));
   if (packetSize == sizeof(LangleyData)) {
     LoRa.readBytes((uint8_t*)&langleyData, sizeof(LangleyData));
@@ -437,6 +437,7 @@ void showChinampaPage1(){
 }
 
 void showChinampaPage2(){
+   display.clearDisplay();
   float rssi = chinampaData.rssi;
   float snr = chinampaData.snr;
   display.print("rssi:");
