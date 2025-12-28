@@ -396,7 +396,7 @@ void showChinampaPage1(){
 // line 2
     display.print("Pump: ");
     if(chinampaData.pumprelaystatus){
-        display.println("ON");
+        display.print("ON");
     }else{
       display.print("OFF");
     }
