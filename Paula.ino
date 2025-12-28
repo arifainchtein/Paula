@@ -408,6 +408,7 @@ void showChinampaPage1(){
       display.println("CLOSE");
     }
 
+
     // line 3
     display.print("F Last:");
     display.print(chinampaData.secondsSinceLastFishTankData);
@@ -420,6 +421,14 @@ void showChinampaPage1(){
     display.print((int)chinampaData.sumpTroughMeasuredHeight);
     display.print(" L:");
     display.print(chinampaData.secondsSinceLastSumpTroughData);
+    
+    if (chinampaData.sumpTroughMeasuredHeight >=(chinampaData.sumpTroughHeight - chinampaData.minimumSumpTroughLevel) ) display.println(" Red");
+    else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.minimumSumpTroughLevel) && chinampaData.sumpTroughMeasuredHeight >= (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel)){
+        display.println(" Green");
+    }else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel)){
+      display.println("  Blue");
+    }
+    
     display.print("Mi:");
     display.print((int)chinampaData.minimumSumpTroughLevel);
     display.print(" Ma:");
@@ -438,6 +447,10 @@ void showChinampaPage1(){
 
 void showChinampaPage2(){
    display.clearDisplay();
+    display.setTextSize(1);  // Switch to smaller text
+    display.setCursor(0, 0);
+  centerText(chinampaData.devicename, 0);
+   display.setCursor(0, 10);
   float rssi = chinampaData.rssi;
   float snr = chinampaData.snr;
   display.print("rssi:");
@@ -478,34 +491,33 @@ void loop() {
     
     
     if (left == LOW && right == HIGH) {
-      Serial.println("  Position: LEFT");
+      //Serial.println("  Position: LEFT");
       if(switchPositionLeft){
           // no change
-          refreshChinampaPage=false;
+          refreshChinampaPage=false;  
       }else{
-        switchPositionLeft=false;
         if(displayingChinampa)refreshChinampaPage=true;
       }
+        switchPositionLeft=true;
     }else if (left == HIGH && right == LOW) {
-      Serial.println("  Position: RIGHT");
+     // Serial.println("  Position: RIGHT");
       if(switchPositionLeft){
           // change
           if(displayingChinampa)refreshChinampaPage=true;
-          switchPositionLeft=false;
       }else{
+        //  no chanfge
         refreshChinampaPage=false;
       }
+      switchPositionLeft=false;
     } 
-      
-    
   }
 
 
   
-    if(refreshChinampaPage){
+    if(displayingChinampa && refreshChinampaPage){
       if(switchPositionLeft)showChinampaPage1();
       else showChinampaPage2();
-      refreshChinampaPage=false;
+      //refreshChinampaPage=false;
     }
   
 if(lastLoraReceptionSeconds>STALE_INTERVAL){
@@ -745,25 +757,22 @@ if (loraReceived) {
           {
             red = 255;
             green = 0;
-            blue = 0;
-            display.println(" Red");
+            blue = 0; 
           } 
           else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.minimumSumpTroughLevel) && chinampaData.sumpTroughMeasuredHeight >= (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel))
           {
             red = 0;
             green = 255;
             blue = 0;
-            display.println(" Green");
+            
           }
           else if (chinampaData.sumpTroughMeasuredHeight < (chinampaData.sumpTroughHeight - chinampaData.maximumSumpTroughLevel))
           {
             red = 0;
             green = 0;
             blue = 255;
-            display.println("  Blue");
+           
           }
-
-
           leds[1] = CRGB(red, green, blue);
           FastLED.show();
 
