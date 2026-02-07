@@ -1,4 +1,3 @@
-
 #include "Arduino.h"
 #include <LoRa.h>
 #include <Timer.h>
@@ -328,6 +327,9 @@ void setup() {
     display.setTextSize(1);
     centerText("LORA Active", 0);
     loraActive = true;
+    LoRa.enableCrc(); 
+     LoRa.setSpreadingFactor(9);
+    LoRa.setSignalBandwidth(125E3);
     //  LoRa.setSpreadingFactor(12);
     // LoRa.setSignalBandwidth(125E3);
     //  LoRa.setCodingRate4(8);
@@ -389,7 +391,7 @@ void centerText(String text, int y) {
   display.print(text);
 }
 
-void showChinampaPage1() {
+ void showChinampaPage1() {
   display.clearDisplay();
   centerText(chinampaData.devicename, 0);
 
@@ -470,6 +472,8 @@ void showChinampaPage1() {
   // display.println((int)chinampaData.sumpTroughHeight);
   display.print("uT:");
   display.print(chinampaData.microtemperature);
+  display.print(" OT:");
+  display.println(chinampaData.outdoortemperature);
   display.print(" RTC:");
   display.print(chinampaData.rtcBatVolt);
   display.println("V");
@@ -625,7 +629,7 @@ void loop() {
       //     leds[4] = CRGB(255, 255, 0);
       //   }else if(snr>=0 && snr<=5){
       //     leds[4] = CRGB(0, 255, 0);
-      //   }else if(snr>5){
+      //   }else if(snr>5){2
       //     leds[4] = CRGB(0, 0, 255);
       //   }
 
@@ -642,7 +646,7 @@ void loop() {
       if (debug) Serial.print("  sleep time=");
       if (debug) Serial.println(digitalStablesData.sleepTime);
 
-      if (isSentByArraySet(digitalStablesData.sentbyarray, sizeof(digitalStablesData.sentbyarray))) {
+      if (!switchPositionLeft || isSentByArraySet(digitalStablesData.sentbyarray, sizeof(digitalStablesData.sentbyarray))) {
         display.clearDisplay();
         centerText(digitalStablesData.devicename, 0);
         display.setTextSize(1);    // Switch to smaller text
