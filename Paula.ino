@@ -11,6 +11,10 @@
 #include <SolarPowerData.h>
 #include <PCF8563TimeManager.h>
 #include <Esp32SecretManager.h>
+#include <VitalSignsRecord.h>
+#include <DeviceCommandRecord.h>
+#include <DeviceCommandQueue.h>
+#include <LinkAckRecord.h>
 //#include <Arduino_JSON.h>
 #include <Wire.h>
 #include <DataManager.h>
@@ -30,6 +34,13 @@ bool inPulse=false;
 // terminals (pins 18/33, same as Daffodil), so this runs locally, not over LoRa/USB to a
 // separate device. qfactor = pulses / (liters * 60) - see runFlowCalibrationLedSequence and the
 // CalibrateFlowSensorXStop handlers below for the derivation and one-person LED-guided workflow.
+// Shown on the OLED (start-up and the "LORA Active" screen), answered to GetFirmware and in
+// GetNearbyDevices (PaulaDeployer's Nearby Devices shows it) - like Annabelle. Add 1 to firmwareVersion
+// with every flashed change; the build time tells two builds of one version apart.
+// 1 = 2026-11-03: Nearby Devices map positions, Ping (signal survey), the first numbered build.
+const int firmwareVersion = 1;
+#define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
+
 static volatile int flowMeterPulseCount;
 static volatile int flowMeterPulseCount2;
 static volatile unsigned long calibrationPulseCount1 = 0;
@@ -70,8 +81,9 @@ uint8_t ultrasonicFrameBufLen = 0;
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1        // Reset pin (-1 if sharing Arduino reset pin)
-#define SCREEN_ADDRESS 0x3C  // Common I2C address (try 0x3D if this doesn't work)
+#define SCREEN_ADDRESS 0x3C  // default; setup() uses 0x3D instead when that is where the OLED answers
 #define SLEEP_SWITCH_26 26
+#define LED_CONTROL 23
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // I2C temperature/humidity sensor test (SHT3x, address 0x44 - same part Daffodil uses on the
@@ -102,7 +114,9 @@ bool switchPositionLeft = true;
 volatile bool clockTicked = false;
 volatile bool lowVoltageAlert = false;
 int lastLoraReceptionSeconds = 0;
-int lastWeatherForecastSeconds = 0;
+// Starts stale: LEDs 2-3 turn green only after a forecast with a valid code arrives (it started at 0,
+// so they were green for 2 h after every boot whether or not Paula's clock was right).
+int lastWeatherForecastSeconds = WEATHER_STALE_INTERVAL + 1;
 
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -132,6 +146,62 @@ bool refreshChinampaPage = false;
 bool loraActive = false;
 volatile bool loraReceived = false;
 volatile int loraPacketSize = 0;
+
+// Nearby devices and WiFi commands (2026-10-14). Paula sends the same DeviceCommandRecord as
+// Annabelle's web page, so a Daffodil's WiFi can be switched on standing next to it, with
+// PaulaDeployer's "Nearby devices" list (serial commands GetNearbyDevices / DeviceWifi). Delivery
+// works like Annabelle's (DeviceCommandQueue.h): resent after the device's VitalSigns until its
+// data shows the change. Everything runs in loop() - onReceive() only sets flags.
+#define NEARBY_MAX 8
+struct NearbyDevice {
+  char name[17];
+  uint8_t serial[8];
+  uint8_t wifiStatus;   // 0 off, 1 own hotspot, 2 router, 3 router + internet
+  long sleepTime;       // s, 0 = awake
+  float batteryVoltage;
+  int rssi;
+  uint32_t lastMs;      // 0 = slot unused
+};
+NearbyDevice nearby[NEARBY_MAX];
+DeviceCommandQueue deviceCommandQueue;
+// The LoRa "L" (LEDs 1, 6, 11, 12 - same glyph as Daffodil's drawLora) flashed for a WiFi command:
+// blue when Paula sends one, green when the device's data shows it worked. While it shows, loop()
+// leaves LEDs 0-3 alone (it rewrites them every pass).
+#define COMMAND_FLASH_MS 3000
+#define COMMAND_FLASH_BRIGHTNESS 80   // brighter than normal (50) so the L stands out (120 was too bright)
+#define NORMAL_BRIGHTNESS 50
+unsigned long commandFlashUntil = 0;
+
+// LoRa Sniffer (2026-10-24): after LoraSniffer#1 (LoraSniffer#0 stops it), one line per packet
+// heard, for PaulaDeployer's "Lora Sniffer" terminal - what the original Paula showed on its OLED:
+//   SNIFF {"type":"DigitalStablesData","size":81,"rssi":-87,"snr":9.50,"name":"Cleotilde","serial":"28FF...","ok":true}
+// ok (checksum / code valid) only for the types already checked; a size Paula doesn't know comes
+// as type "Unknown" with the bytes in "hex". Off after every boot.
+bool loraSniffer = false;
+
+// lat/lon (2026-11-03, PaulaDeployer's Signal Map): the position the sender broadcasts in its data
+// packet, NAN for packet types that carry none. 0/0 (never configured) is left out too.
+void printSniff(const char *type, int size, float rssi, float snr, const char *name, size_t nameLen, const uint8_t *serial, int ok, float lat, float lon) {
+  Serial.printf("SNIFF {\"type\":\"%s\",\"size\":%d,\"rssi\":%d,\"snr\":%.2f", type, size, (int)rssi, snr);
+  if (name) {
+    Serial.print(",\"name\":\"");
+    for (size_t i = 0; i < nameLen && name[i]; i++) {
+      char c = name[i];
+      Serial.print((c >= 32 && c < 127 && c != '"' && c != '\\') ? c : '?');
+    }
+    Serial.print("\"");
+  }
+  if (serial) {
+    Serial.print(",\"serial\":\"");
+    for (int b = 0; b < 8; b++) Serial.printf("%02X", serial[b]);
+    Serial.print("\"");
+  }
+  if (ok >= 0) Serial.printf(",\"ok\":%s", ok ? "true" : "false");
+  if (isfinite(lat) && isfinite(lon) && fabsf(lat) <= 90 && fabsf(lon) <= 180 && !(lat == 0 && lon == 0)) {
+    Serial.printf(",\"lat\":%.6f,\"lon\":%.6f", lat, lon);
+  }
+  Serial.println("}");
+}
 
 
 TaskHandle_t ledShowTask = NULL;
@@ -233,6 +303,138 @@ void onReceive(int packetSize) {
 }
 
 
+// XOR of every byte except the one at checksumOffset - the checksum rule of the LoRa structs.
+uint8_t xorChecksum(const void *data, size_t size, size_t checksumOffset) {
+  const uint8_t *p = (const uint8_t *)data;
+  uint8_t c = 0;
+  for (size_t i = 0; i < size; i++) if (i != checksumOffset) c ^= p[i];
+  return c;
+}
+
+void noteNearby(const DigitalStablesData &d) {
+  int slot = -1, oldest = 0;
+  for (int i = 0; i < NEARBY_MAX; i++) {
+    if (nearby[i].lastMs && memcmp(nearby[i].serial, d.serialnumberarray, 8) == 0) { slot = i; break; }
+    if (!nearby[i].lastMs) { if (slot < 0) slot = i; continue; }
+    if (nearby[i].lastMs < nearby[oldest].lastMs) oldest = i;
+  }
+  // a free slot found before the device's own one would duplicate it - look again
+  for (int i = 0; i < NEARBY_MAX; i++) {
+    if (nearby[i].lastMs && memcmp(nearby[i].serial, d.serialnumberarray, 8) == 0) { slot = i; break; }
+  }
+  if (slot < 0) slot = oldest;
+  NearbyDevice &n = nearby[slot];
+  memset(n.name, 0, sizeof(n.name));
+  for (int i = 0; i < 16 && i < (int)sizeof(d.devicename) && d.devicename[i]; i++) {
+    n.name[i] = (d.devicename[i] >= 32 && d.devicename[i] < 127) ? d.devicename[i] : '?';
+  }
+  memcpy(n.serial, d.serialnumberarray, 8);
+  n.wifiStatus = d.wifiStatus;
+  n.sleepTime = d.sleepTime;
+  n.batteryVoltage = d.batteryVoltage;
+  n.rssi = (int)d.rssi;
+  n.lastMs = millis();
+}
+
+void flashLoraL(CRGB color) {
+  for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
+  leds[1] = leds[6] = leds[11] = leds[12] = color;
+  FastLED.setBrightness(COMMAND_FLASH_BRIGHTNESS);
+  FastLED.show();
+  commandFlashUntil = millis() + COMMAND_FLASH_MS;
+}
+
+// Returns the senderTime it was stamped with (the ping's id - see the Ping command).
+uint32_t sendDeviceCommand(DeviceCommandRecord c) {
+  c.senderTime = (uint32_t)timeManager.getTimeForCodeGeneration();
+  c.totpcode = secretManager.generateCodeAt(c.senderTime);
+  c.sender = DEVICE_COMMAND_SENDER_PAULA;
+  c.checksum = deviceCommandChecksum(c);
+  LoRa_txMode();
+  LoRa.beginPacket();
+  LoRa.write((uint8_t *)&c, sizeof(c));
+  bool sent = LoRa.endPacket();
+  LoRa_rxMode();
+  flashLoraL(sent ? CRGB(0, 0, 255) : CRGB(255, 0, 0));  // red L = the radio failed to send
+  if (debug) Serial.printf("device command %u sent: %s\n", c.command, sent ? "ok" : "failed");
+  return sent ? c.senderTime : 0;
+}
+
+// ---- Signal survey ping (2026-11-03, PaulaDeployer's Nearby Devices map) ----
+// "Ping#<dBm>": one DEVICE_COMMAND_PING to every device, sent at that transmit power - 5 dBm by
+// default, a Daffodil's (and Langley's, Gloria's) power, so the answers say what a device placed here
+// would get, not what Paula's stronger 17 dBm would. Back to 17 dBm right after. Answers come as
+// LinkAckRecords within LINK_ACK_LISTEN_MS, printed as SNIFF lines (printLinkAck).
+// Replies "Ok-Ping#<senderTime>#<number>#<dBm>" (senderTime 0 = not sent).
+#define PAULA_TX_POWER 17   // the LoRa library's default, which Paula has always used
+uint16_t pingNumber = 0;
+
+void sendPing(int power) {
+  DeviceCommandRecord c;
+  memset(c.serialnumberarray, 0xFF, 8);
+  c.command = DEVICE_COMMAND_PING;
+  pingNumber++;
+  c.reserved[0] = pingNumber & 0xFF;
+  c.reserved[1] = pingNumber >> 8;
+  LoRa.setTxPower(power);
+  uint32_t id = sendDeviceCommand(c);
+  LoRa.setTxPower(PAULA_TX_POWER);
+  Serial.printf("Ok-Ping#%lu#%u#%d\n", (unsigned long)id, pingNumber, power);
+}
+
+// One SNIFF line per answer: the usual fields (rssi/snr = how Paula heard the answer) plus
+//   "probe","seq"          which ping it answers
+//   "kind"                 1 Annabelle, 2 Daffodil
+//   "prssi","psnr"         how the device heard the ping
+//   "grssi","gsnr","gage"  how it hears Annabelle (absent when unknown, and for Annabelle itself)
+void printLinkAck(const LinkAckRecord &a, int size, int rssi, float snr) {
+  bool ok = linkAckValid(a);
+  Serial.printf("SNIFF {\"type\":\"LinkAck\",\"size\":%d,\"rssi\":%d,\"snr\":%.2f,\"name\":\"", size, rssi, snr);
+  for (size_t i = 0; i < sizeof(a.devicename) && a.devicename[i]; i++) {
+    char ch = a.devicename[i];
+    Serial.print((ch >= 32 && ch < 127 && ch != '"' && ch != '\\') ? ch : '?');
+  }
+  Serial.print("\",\"serial\":\"");
+  for (int b = 0; b < 8; b++) Serial.printf("%02X", a.serialnumberarray[b]);
+  Serial.printf("\",\"ok\":%s,\"probe\":%lu,\"seq\":%u,\"kind\":%u,\"prssi\":%d,\"psnr\":%.2f",
+                ok ? "true" : "false", (unsigned long)a.probeTime, a.probeSeq, a.kind, a.probeRssi, a.probeSnrQ / 4.0);
+  if (a.gatewayAgeSec != LINK_ACK_GATEWAY_UNKNOWN_AGE) {
+    Serial.printf(",\"grssi\":%d,\"gsnr\":%.2f,\"gage\":%u", a.gatewayRssi, a.gatewaySnrQ / 4.0, a.gatewayAgeSec);
+  }
+  if (isfinite(a.latitude) && isfinite(a.longitude) && fabsf(a.latitude) <= 90 && fabsf(a.longitude) <= 180
+      && !(a.latitude == 0 && a.longitude == 0)) {
+    Serial.printf(",\"lat\":%.6f,\"lon\":%.6f", a.latitude, a.longitude);
+  }
+  Serial.println("}");
+}
+
+// One JSON line: {"now":<ms>,"devices":[{name,serial,wifi,sleep,battery,rssi,ageSec,cmd:{on,state,sends,ageSec}}]}
+void printNearbyDevices() {
+  uint32_t now = millis();
+  // paulaTime: Paula's clock as code time (local fields as seconds, like the commands' senderTime) -
+  // PaulaDeployer compares it with the Pi's clock, since a Daffodil rejects commands >15 min off.
+  Serial.printf("{\"paulaTime\":%ld,\"firmware\":\"Version %d (%s)\",\"devices\":[", timeManager.getTimeForCodeGeneration(),
+                firmwareVersion, FIRMWARE_BUILD_TIME);
+  bool first = true;
+  for (int i = 0; i < NEARBY_MAX; i++) {
+    const NearbyDevice &n = nearby[i];
+    if (!n.lastMs) continue;
+    char sn[17];
+    for (int b = 0; b < 8; b++) snprintf(sn + b * 2, 3, "%02X", n.serial[b]);
+    if (!first) Serial.print(",");
+    first = false;
+    Serial.printf("{\"name\":\"%s\",\"serial\":\"%s\",\"wifi\":%u,\"sleep\":%ld,\"battery\":%.2f,\"rssi\":%d,\"ageSec\":%lu",
+                  n.name, sn, n.wifiStatus, n.sleepTime, n.batteryVoltage, n.rssi, (unsigned long)((now - n.lastMs) / 1000));
+    DeviceCommandQueue::Slot c = deviceCommandQueue.status(n.serial);
+    if (c.state != DEVICE_COMMAND_STATE_NONE) {
+      Serial.printf(",\"cmd\":{\"on\":%s,\"state\":%u,\"sends\":%u,\"ageSec\":%lu}", c.command == DEVICE_COMMAND_WIFI_ON ? "true" : "false",
+                    c.state, c.sends, (unsigned long)((now - c.createdMs) / 1000));
+    }
+    Serial.print("}");
+  }
+  Serial.println("]}");
+}
+
 void processLora(int packetSize) {
 
   lastLoraReceptionSeconds = 0;
@@ -247,6 +449,7 @@ void processLora(int packetSize) {
 
     langleyData.rssi = LoRa.packetRssi();
     langleyData.snr = LoRa.packetSnr();
+    if (loraSniffer) printSniff("LangleyData", packetSize, langleyData.rssi, langleyData.snr, langleyData.devicename, sizeof(langleyData.devicename), langleyData.serialnumberarray, -1, langleyData.latitude, langleyData.longitude);
 
 
 
@@ -261,6 +464,7 @@ void processLora(int packetSize) {
 
     gloriaTankFlowPumpData.rssi = LoRa.packetRssi();
     gloriaTankFlowPumpData.snr = LoRa.packetSnr();
+    if (loraSniffer) printSniff("GloriaTankFlowPumpData", packetSize, gloriaTankFlowPumpData.rssi, gloriaTankFlowPumpData.snr, gloriaTankFlowPumpData.devicename, sizeof(gloriaTankFlowPumpData.devicename), gloriaTankFlowPumpData.serialnumberarray, -1, gloriaTankFlowPumpData.latitude, gloriaTankFlowPumpData.longitude);
 
 
   } else if (packetSize == sizeof(ChinampaData)) {
@@ -269,6 +473,7 @@ void processLora(int packetSize) {
 
     chinampaData.rssi = LoRa.packetRssi();
     chinampaData.snr = LoRa.packetSnr();
+    if (loraSniffer) printSniff("ChinampaData", packetSize, chinampaData.rssi, chinampaData.snr, chinampaData.devicename, sizeof(chinampaData.devicename), chinampaData.serialnumberarray, -1, chinampaData.latitude, chinampaData.longitude);
     //if(debug)
     if (debug) Serial.print("received chinampaData from ");
     if (debug) Serial.print(chinampaData.devicename);
@@ -280,11 +485,25 @@ void processLora(int packetSize) {
   } else if (packetSize == sizeof(DigitalStablesData)) {
     memset(&digitalStablesData, 0, sizeof(DigitalStablesData));
     LoRa.readBytes((uint8_t*)&digitalStablesData, sizeof(DigitalStablesData));
+    // Checked on the bytes as received, before rssi/snr (inside the checksummed range) are overwritten.
+    bool dsChecksumOk = xorChecksum(&digitalStablesData, sizeof(DigitalStablesData), offsetof(DigitalStablesData, checksum))
+                        == digitalStablesData.checksum;
     digitalStablesDataNewData = true;
     digitalStablesData.rssi = LoRa.packetRssi();
     digitalStablesData.snr = LoRa.packetSnr();
+    if (loraSniffer) printSniff("DigitalStablesData", packetSize, digitalStablesData.rssi, digitalStablesData.snr, digitalStablesData.devicename, sizeof(digitalStablesData.devicename), digitalStablesData.serialnumberarray, dsChecksumOk, digitalStablesData.latitude, digitalStablesData.longitude);
     dataManager.storeDigitalStablesData(digitalStablesData);
      dataManager.printDigitalStablesData(digitalStablesData);
+    if (dsChecksumOk) {
+      noteNearby(digitalStablesData);
+      uint8_t before = deviceCommandQueue.status(digitalStablesData.serialnumberarray).state;
+      deviceCommandQueue.noteDataPacket(digitalStablesData.serialnumberarray, digitalStablesData.wifiStatus != 0,
+                                        digitalStablesData.sleepTime > 0, millis());
+      if (before == DEVICE_COMMAND_STATE_PENDING &&
+          deviceCommandQueue.status(digitalStablesData.serialnumberarray).state == DEVICE_COMMAND_STATE_DONE) {
+        flashLoraL(CRGB(0, 255, 0));  // the device's WiFi is now as requested
+      }
+    }
     //if(debug)
     if (debug) Serial.print("received digitalStablesData from ");
     if (debug) Serial.print(digitalStablesData.devicename);
@@ -301,10 +520,29 @@ void processLora(int packetSize) {
     if (debug) Serial.print(digitalStablesData.estimatedRuntime);
     if (debug) Serial.print(" operatingStatus=");
     if (debug) Serial.println(digitalStablesData.operatingStatus);
+  } else if (packetSize == sizeof(VitalSignsRecord)) {
+    // Only for command delivery: a sleeping Daffodil listens right after its VitalSigns.
+    VitalSignsRecord vs;
+    LoRa.readBytes((uint8_t*)&vs, sizeof(VitalSignsRecord));
+    bool vsOk = xorChecksum(&vs, sizeof(vs), offsetof(VitalSignsRecord, checksum)) == vs.checksum;
+    if (vsOk) {
+      deviceCommandQueue.noteVitalSigns(vs.serialnumberarray, millis());
+    }
+    if (loraSniffer) printSniff("VitalSignsRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, vs.serialnumberarray, vsOk, NAN, NAN);
+  } else if (packetSize == sizeof(VitalSignsRecordV3)) {
+    // Version 3 (89 bytes) from a Daffodil not yet on v4 - the serial is in the same place.
+    VitalSignsRecordV3 vs3;
+    LoRa.readBytes((uint8_t*)&vs3, sizeof(VitalSignsRecordV3));
+    bool vs3Ok = xorChecksum(&vs3, sizeof(vs3), offsetof(VitalSignsRecordV3, checksum)) == vs3.checksum;
+    if (vs3Ok) {
+      deviceCommandQueue.noteVitalSigns(vitalSignsFromV3(vs3).serialnumberarray, millis());
+    }
+    if (loraSniffer) printSniff("VitalSignsRecordV3", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, vitalSignsFromV3(vs3).serialnumberarray, vs3Ok, NAN, NAN);
   } else if (packetSize == sizeof(WeatherForecastUpdate)) {
     WeatherForecastUpdate wfu;
     LoRa.readBytes((uint8_t*)&wfu, sizeof(WeatherForecastUpdate));
     bool validCode = secretManager.checkCode(wfu.totpcode);
+    if (loraSniffer) printSniff("WeatherForecastUpdate", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, NULL, validCode, NAN, NAN);
     if (validCode) {
       for (int i = 0; i < 4; i++) storedForecasts[i] = wfu.forecasts[i];
       weatherForecastReceivedTime = currentTimerRecord;
@@ -322,9 +560,22 @@ void processLora(int packetSize) {
 
     seedlingMonitorData.rssi = LoRa.packetRssi();
     seedlingMonitorData.snr = LoRa.packetSnr();
+    if (loraSniffer) printSniff("SeedlingMonitorData", packetSize, seedlingMonitorData.rssi, seedlingMonitorData.snr, seedlingMonitorData.devicename, sizeof(seedlingMonitorData.devicename), seedlingMonitorData.serialnumberarray, -1, NAN, NAN);
     //if(debug)
     if (debug) Serial.print("received SeedlingMonitorData from ");
     if (debug) Serial.println(seedlingMonitorData.devicename);
+  } else if (packetSize == sizeof(LinkAckRecord)) {
+    // An answer to Paula's ping (sendPing) - for the map; printed whether or not the sniffer is on.
+    LinkAckRecord ack;
+    LoRa.readBytes((uint8_t*)&ack, sizeof(LinkAckRecord));
+    printLinkAck(ack, packetSize, LoRa.packetRssi(), LoRa.packetSnr());
+  } else if (loraSniffer) {
+    // A size Paula has no struct for - shown raw, so new/foreign senders are still visible.
+    uint8_t raw[256];
+    int n = LoRa.readBytes(raw, packetSize < (int)sizeof(raw) ? packetSize : (int)sizeof(raw));
+    Serial.printf("SNIFF {\"type\":\"Unknown\",\"size\":%d,\"rssi\":%d,\"snr\":%.2f,\"hex\":\"", packetSize, LoRa.packetRssi(), LoRa.packetSnr());
+    for (int i = 0; i < n; i++) Serial.printf("%02X", raw[i]);
+    Serial.println("\"}");
   }
 }
 
@@ -346,8 +597,17 @@ void setup() {
  }else{
    if(debug)Serial.println("LittleFS Mount Succces"); 
  }
+  // DEVICE_POWER on (ADS1115, sensor terminals) - always HIGH on Paula: it never sleeps, and
+  // nothing else in this sketch touches pin 26. The hold release covers a board last flashed
+  // with Daffodil.ino, which holds the pin LOW through deep sleep.
+  gpio_hold_dis((gpio_num_t)SLEEP_SWITCH_26);
   pinMode(SLEEP_SWITCH_26, OUTPUT);
   digitalWrite(SLEEP_SWITCH_26, HIGH);
+  // The Daffodil shield powers its WS2812 LEDs through a load switch on GPIO23 (Daffodil.ino
+  // LED_CONTROL, HIGH = on). Paula never set it, so its LEDs stayed dark (found 2026-10-14).
+  gpio_hold_dis((gpio_num_t)LED_CONTROL);
+  pinMode(LED_CONTROL, OUTPUT);
+  digitalWrite(LED_CONTROL, HIGH);
 
   if(debug)Serial.print("DigitalStablesData size=");
   if(debug)Serial.println(sizeof(DigitalStablesData));
@@ -359,17 +619,21 @@ void setup() {
   if(debug)Serial.print("seedlingMonitorData size=");
   if(debug)Serial.println(sizeof(SeedlingMonitorData));
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+  // The OLED answers at 0x3C or 0x3D (written 0x78 / 0x7A on the back of 0.96" modules, set by a
+  // resistor) - use whichever is there, 0x3C if neither answers (2026-11-03).
+  uint8_t oledAddress = SCREEN_ADDRESS;
+  Wire.beginTransmission(0x3C);
+  if (Wire.endTransmission() != 0) {
+    Wire.beginTransmission(0x3D);
+    if (Wire.endTransmission() == 0) oledAddress = 0x3D;
+  }
+  if (debug) Serial.printf("OLED at 0x%02X\n", oledAddress);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, oledAddress)) {
     if(debug)Serial.println(F("SSD1309 allocation failed"));
     for (;;)
       ;  // Loop forever if failed
   }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("Please Wait"));
-  display.display();
+  showVersionBanner("Please Wait");
 
 
   pinMode(SENSOR_INPUT_1, INPUT);
@@ -390,7 +654,7 @@ void setup() {
   currentTimerRecord = timeManager.now();
   timeManager.printTimeToSerial(currentTimerRecord);
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(10);
+  FastLED.setBrightness(NORMAL_BRIGHTNESS);
 
   for (int i = 0; i < NUM_LEDS; i++) {
     leds[i] = CRGB(255, 255, 0);
@@ -427,9 +691,7 @@ void setup() {
   } else {
 
     //leds[1] = CRGB(0, 0, 255);
-    display.clearDisplay();
-    display.setTextSize(1);
-    centerText("LORA Active", 0);
+    showVersionBanner("LORA Active");  // stays until the first packet is shown
     loraActive = true;
     LoRa.enableCrc(); 
      LoRa.setSpreadingFactor(9);
@@ -445,6 +707,10 @@ void setup() {
     // LoRa_rxMode();
     // LoRa.setSyncWord(0xF3);
     LoRa.onReceive(onReceive);
+    // Yellow L for 2 s: the radio started and the command LEDs work (blue = command sent,
+    // green = confirmed - see flashLoraL()).
+    flashLoraL(CRGB(255, 200, 0));
+    delay(2000);
     // put the radio into receive mode
     LoRa.receive();
 
@@ -478,6 +744,23 @@ void setup() {
 bool doit = true;
 
 
+
+// "Paula", the firmware version and build time - the way to see which build is flashed - under a
+// one-line status. Drawn and shown at once.
+void showVersionBanner(const char *status) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  centerText(status, 0);
+  display.setTextSize(2);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds("Paula", 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 14);
+  display.print("Paula");
+  centerText("Version " + String(firmwareVersion), 38);
+  centerText(FIRMWARE_BUILD_TIME, 50);
+  display.display();
+}
 
 void centerText(String text, int y) {
   display.setTextSize(1);
@@ -716,7 +999,7 @@ bool isSentByArraySet(uint8_t* arr, size_t size) {
 // useful field diagnostic - the sensor (or its wiring) likely isn't producing pulses at all,
 // independent of whatever qfactor math would otherwise follow.
 unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, volatile unsigned long &pulseCounter) {
-  uint8_t savedBrightness = 10;  // Paula's normal LED brightness, set once in setup()
+  uint8_t savedBrightness = NORMAL_BRIGHTNESS;  // Paula's normal LED brightness, set once in setup()
   FastLED.setBrightness(255);
 
   for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
@@ -780,11 +1063,20 @@ void loop() {
     //refreshChinampaPage=false;
   }
 
-  leds[0] = (currentIpAddress != "No IP") ? CRGB(0, 255, 0) : CRGB(32, 0, 0);
-  leds[1] = loraActive ? CRGB(0, 255, 0) : CRGB(255, 0, 0);
-  leds[2] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
-  leds[3] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
-  FastLED.show();
+  if (commandFlashUntil && (long)(millis() - commandFlashUntil) < 0) {
+    // the command "L" is showing - see flashLoraL()
+  } else {
+    if (commandFlashUntil) {
+      leds[6] = leds[11] = leds[12] = CRGB(0, 0, 0);  // rest of the L; LED 1 is set just below
+      FastLED.setBrightness(NORMAL_BRIGHTNESS);
+      commandFlashUntil = 0;
+    }
+    leds[0] = (currentIpAddress != "No IP") ? CRGB(0, 255, 0) : CRGB(32, 0, 0);
+    leds[1] = loraActive ? CRGB(0, 255, 0) : CRGB(255, 0, 0);
+    leds[2] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
+    leds[3] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
+    FastLED.show();
+  }
   if (loraReceived) {
     //Serial.printf("lora recive Free Heap: %d \n", xPortGetFreeHeapSize());
     if (debug) Serial.printf("lora recive loraPacketSize: %d \n", loraPacketSize);
@@ -1000,6 +1292,11 @@ void loop() {
   }
   loraPacketSize = 0;
 
+  {
+    DeviceCommandRecord command;
+    if (deviceCommandQueue.takeDue(millis(), command)) sendDeviceCommand(command);
+  }
+
   if (Serial.available() != 0) {
   
     String command = Serial.readString();
@@ -1015,6 +1312,9 @@ void loop() {
         Serial.flush();
     } else if (command.startsWith("SetFieldId")) {
       // fieldId= GeneralFunctions::getValue(command, '#', 1).toInt();
+    } else if (command.startsWith("GetFirmware")) {
+      Serial.println("Version " + String(firmwareVersion) + " " FIRMWARE_BUILD_TIME);
+      Serial.println(F("Ok-GetFirmware"));
     } else if (command.startsWith("GetTime")) {
       timeManager.printTimeToSerial(currentTimerRecord);
       Serial.flush();
@@ -1157,6 +1457,41 @@ void loop() {
       display.println(statusText);
       display.display();
       Serial.println("Ok-SetStatusText");
+      Serial.flush();
+    } else if (command.startsWith("Ping")) {
+      // Ping#<dBm> - see sendPing(). 2..17 dBm (the radio's PA_BOOST range); default 5.
+      int power = generalFunctions.getValue(command, '#', 1).toInt();
+      if (power < 2 || power > 17) power = 5;
+      sendPing(power);
+      Serial.flush();
+    } else if (command.startsWith("LoraSniffer")) {
+      // LoraSniffer#1 / LoraSniffer#0 - see printSniff()
+      loraSniffer = generalFunctions.getValue(command, '#', 1).toInt() > 0;
+      Serial.println("Ok-LoraSniffer");
+      Serial.flush();
+    } else if (command.startsWith("GetNearbyDevices")) {
+      printNearbyDevices();
+      Serial.println("Ok-GetNearbyDevices");
+      Serial.flush();
+    } else if (command.startsWith("DeviceWifi")) {
+      // DeviceWifi#<serial, 16 hex digits>#on|off - PaulaDeployer's Nearby devices button
+      String sn = generalFunctions.getValue(command, '#', 1);
+      String state = generalFunctions.getValue(command, '#', 2);
+      state.trim();
+      uint8_t serial[8];
+      bool valid = sn.length() == 16 && (state == "on" || state == "off");
+      for (int i = 0; valid && i < 8; i++) {
+        char hex[3] = { sn[i * 2], sn[i * 2 + 1], 0 };
+        char *end;
+        serial[i] = (uint8_t)strtoul(hex, &end, 16);
+        valid = *end == 0;
+      }
+      if (valid) {
+        deviceCommandQueue.request(serial, state == "on" ? DEVICE_COMMAND_WIFI_ON : DEVICE_COMMAND_WIFI_OFF, 0, millis());
+        Serial.println("Ok-DeviceWifi");
+      } else {
+        Serial.println("Failure-DeviceWifi: expected DeviceWifi#<16 hex digits>#on|off");
+      }
       Serial.flush();
     } else if (command.startsWith("GetSwitchState")) {
       // Left/Right pins no longer host a physical switch on this board (33 is now Flow
