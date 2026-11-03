@@ -1,9 +1,0 @@
-{
-  "additionalFiles": "../../..,../..",
-  "compiler.optimization_flags": "-Os",
-  "customBuildProperties": "",
-  "fqbn": "esp32:esp32:esp32",
-  "hardwareFolders": "/home/ari/.arduino15/packages/esp32/hardware/esp32/3.3.7,/home/ari/.arduino15/packages/esp32/hardware/esp32/3.3.7",
-  "otherLibrariesFolders": "/home/ari/Data/DigitalStables/ProjectsSupport/Esp32ArduinoLib/libraries,/home/ari/Arduino/libraries",
-  "sketchLocation": "/home/ari/Data/DigitalStables/Projects/Paula"
-}

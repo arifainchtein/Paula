@@ -38,7 +38,9 @@ bool inPulse=false;
 // GetNearbyDevices (PaulaDeployer's Nearby Devices shows it) - like Annabelle. Add 1 to firmwareVersion
 // with every flashed change; the build time tells two builds of one version apart.
 // 1 = 2026-11-03: Nearby Devices map positions, Ping (signal survey), the first numbered build.
-const int firmwareVersion = 1;
+// 2 = 2026-11-03: a factory product like the rest - GetProductDefinition / SetProductDefinition /
+//     GetSerialNumber (Inspect, deploy packages, Allocate Customer); plain "Ping" is Ok-Ping again.
+const int firmwareVersion = 2;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -1312,6 +1314,42 @@ void loop() {
         Serial.flush();
     } else if (command.startsWith("SetFieldId")) {
       // fieldId= GeneralFunctions::getValue(command, '#', 1).toInt();
+    } else if (command.startsWith("GetSerialNumber")) {
+      // Same form as serialnumberextractor (what the factory records): 12 lowercase hex of the efuse MAC, then Ok
+      Serial.printf("%012llx", ESP.getEfuseMac());
+      Serial.println("Ok");
+      Serial.flush();
+    } else if (command.startsWith("SetProductDefinition")) {
+      // SetProductDefinition#<name>#<powerSource>#<battery>#<pcbs>#<firmware> - as Daffodil/Langley (2026-11-03)
+      secretManager.saveProductDefinition(generalFunctions.getValue(command, '#', 1), generalFunctions.getValue(command, '#', 2),
+                                          generalFunctions.getValue(command, '#', 3), generalFunctions.getValue(command, '#', 4),
+                                          generalFunctions.getValue(command, '#', 5));
+      Serial.println("Ok-SetProductDefinition");
+      Serial.flush();
+    } else if (command.startsWith("GetProductDefinition")) {
+      // Same reply as Langley/Daffodil, so Inspect and the factory/PaulaDeployer parsers need no branch:
+      // name#power#battery#pcbs#firmware#commission#ssid#wifipass#apssid#appass#host#mode#now#devicename#shortname#serial
+      String pdName, pdPowerSource, pdBattery, pdPcbs, pdFirmware;
+      secretManager.getProductDefinition(pdName, pdPowerSource, pdBattery, pdPcbs, pdFirmware);
+      unsigned long commissionDate = secretManager.getCommissionDate();
+      if (commissionDate < 1704067200UL) {  // before 2024-01-01 = never set (RTC default) - capture now, as Langley does
+        commissionDate = timeManager.getCurrentTimeInSeconds(timeManager.now());
+        secretManager.setCommissionDate(commissionDate);
+      }
+      char pdDeviceName[64] = {0}, pdDeviceShortName[64] = {0}, s1[64] = {0}, s2[64] = {0};
+      String tz;
+      double lat = 0, lon = 0, alt = 0;
+      uint8_t minLed = 0, minWifi = 0;
+      secretManager.getDeviceSensorConfig(pdDeviceName, pdDeviceShortName, s1, s2, tz, lat, lon, alt, minLed, minWifi);
+      char pdSerial[13];
+      snprintf(pdSerial, sizeof(pdSerial), "%012llx", ESP.getEfuseMac());
+      Serial.println("Ok-GetProductDefinition#" + pdName + "#" + pdPowerSource + "#" + pdBattery + "#" + pdPcbs + "#" + pdFirmware + "#"
+                     + String(commissionDate) + "#" + secretManager.getSSID() + "#" + secretManager.getWifiPassword() + "#"
+                     + secretManager.getSoftAPSSID() + "#" + secretManager.getSoftAPPASS() + "#" + secretManager.getHostName() + "#"
+                     + (secretManager.getStationMode() ? "Station" : "AccessPoint") + "#"
+                     + String(timeManager.getCurrentTimeInSeconds(timeManager.now())) + "#" + String(pdDeviceName) + "#"
+                     + String(pdDeviceShortName) + "#" + String(pdSerial));
+      Serial.flush();
     } else if (command.startsWith("GetFirmware")) {
       Serial.println("Version " + String(firmwareVersion) + " " FIRMWARE_BUILD_TIME);
       Serial.println(F("Ok-GetFirmware"));
@@ -1458,7 +1496,12 @@ void loop() {
       display.display();
       Serial.println("Ok-SetStatusText");
       Serial.flush();
-    } else if (command.startsWith("Ping")) {
+    } else if (command == "Ping") {
+      // Plain "Ping": the factory's / flasher's "are you alive?" - answered like every other firmware.
+      // (Before 2026-11-03 it fell into Ping#<dBm> below and sent a LoRa survey ping each time.)
+      Serial.println(F("Ok-Ping"));
+      Serial.flush();
+    } else if (command.startsWith("Ping#")) {
       // Ping#<dBm> - see sendPing(). 2..17 dBm (the radio's PA_BOOST range); default 5.
       int power = generalFunctions.getValue(command, '#', 1).toInt();
       if (power < 2 || power > 17) power = 5;
