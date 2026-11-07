@@ -48,7 +48,7 @@ bool inPulse=false;
 // 5 = 2026-11-07: ReadClipsal2US - "Clipsal 2US" test, two DYP-A02 UART ultrasonics (18 and 33) through a
 //     ClipsallJunctionBoxWaterTrough_2US board; the second one on UART1 (ultrasonicSerial2).
 // 6 = 2026-11-07: ReadVoltageMonitor - "Clipsal Voltage Monitor" test (INA228 at 0x4F + battery NTC on the
-//     pin-18 terminal, ANALOG jumper, ADS1115 AIN1).
+//     pin-33 terminal, ANALOG jumper, ADS1115 AIN0).
 const int firmwareVersion = 6;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -334,8 +334,9 @@ void startFlowMode();
 
 // "Clipsal Voltage Monitor" (2026-11-07): HardwareDesign/Clipsall_VoltageMonitor - an INA228 at 0x4F
 // (A0 = A1 = SCL) on Paula's I2C terminal, measuring the battery on its J3 (VBUS, through 1k) and an
-// external shunt on J4 (I+/I-), plus a battery NTC divider whose output (J2 "TEMP") goes to Paula's
-// pin-18 terminal with the jumper on ANALOG -> ADS1115 AIN1. The INA228 is read register by register
+// external shunt in the battery negative lead on J4 (I+/I-, Kelvin sense), plus a battery 10k NTC
+// divider whose output (J2 "TEMP") goes to the pin-33 terminal with the jumper on ANALOG (Daffodil
+// JP5) -> ADS1115 AIN0, as the board's own spec says for Daffodil. The INA228 is read register by register
 // at its power-on defaults (continuous conversions, ADCRANGE 0 = +-163.84 mV shunt range); the current
 // is worked out on the Pi from the shunt value the page is given.
 #define INA228_ADDRESS 0x4F
@@ -368,7 +369,7 @@ void readVoltageMonitor() {
   float ntcV = -99, v50V = -99;
   if (ADS.isConnected()) {
     ADS.setGain(0);
-    ntcV = ADS.readADC(1) * ADS.toVoltage(1);  // pin-18 terminal, ANALOG jumper
+    ntcV = ADS.readADC(0) * ADS.toVoltage(1);  // pin-33 terminal, ANALOG jumper (JP5) = AIN0
     v50V = ADS.readADC(3) * ADS.toVoltage(1);  // AIN3 = V50_I (pre-diode input), only a guide to V50
   }
   Serial.println("inaFound=" + String(found ? 1 : 0)
