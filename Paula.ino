@@ -48,8 +48,9 @@ bool inPulse=false;
 // 5 = 2026-11-07: ReadClipsal2US - "Clipsal 2US" test, two DYP-A02 UART ultrasonics (18 and 33) through a
 //     ClipsallJunctionBoxWaterTrough_2US board; the second one on UART1 (ultrasonicSerial2).
 // 6 = 2026-11-07: ReadVoltageMonitor - "Clipsal Voltage Monitor" test (INA228 at 0x4F + battery NTC on the
-//     pin-33 terminal, ANALOG jumper, ADS1115 AIN0).
-const int firmwareVersion = 6;
+//     pin-18 terminal, ANALOG jumper, ADS1115 AIN1).
+// 7 = 2026-11-07: ReadVoltageMonitor reads the NTC on AIN0 (pin-33 terminal, JP5) per the board's spec.
+const int firmwareVersion = 7;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -379,7 +380,8 @@ void readVoltageMonitor() {
                  + " vshuntMV=" + String(vshuntMV, 5)
                  + " inaDieTempC=" + String(dieTempC, 2)
                  + " ntcV=" + String(ntcV, 4)
-                 + " v50V=" + String(v50V, 4));
+                 + " v50V=" + String(v50V, 4)
+                 + " ntcAin=0");  // tells PaulaDeployer this is v7+, not v6 (which read AIN1)
   Serial.println("Ok-ReadVoltageMonitor");
   Serial.flush();
 }
