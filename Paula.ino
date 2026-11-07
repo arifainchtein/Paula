@@ -47,7 +47,9 @@ bool inPulse=false;
 //     DS18B20 water temperature on 33 through a ClipsallJunctionBoxWaterTrough board).
 // 5 = 2026-11-07: ReadClipsal2US - "Clipsal 2US" test, two DYP-A02 UART ultrasonics (18 and 33) through a
 //     ClipsallJunctionBoxWaterTrough_2US board; the second one on UART1 (ultrasonicSerial2).
-const int firmwareVersion = 5;
+// 6 = 2026-11-07: ReadVoltageMonitor - "Clipsal Voltage Monitor" test (INA228 at 0x4F + battery NTC on the
+//     pin-18 terminal, ANALOG jumper, ADS1115 AIN1).
+const int firmwareVersion = 6;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -329,6 +331,57 @@ void pollUltrasonicSerial() {
 
 void startUltrasonicMode();
 void startFlowMode();
+
+// "Clipsal Voltage Monitor" (2026-11-07): HardwareDesign/Clipsall_VoltageMonitor - an INA228 at 0x4F
+// (A0 = A1 = SCL) on Paula's I2C terminal, measuring the battery on its J3 (VBUS, through 1k) and an
+// external shunt on J4 (I+/I-), plus a battery NTC divider whose output (J2 "TEMP") goes to Paula's
+// pin-18 terminal with the jumper on ANALOG -> ADS1115 AIN1. The INA228 is read register by register
+// at its power-on defaults (continuous conversions, ADCRANGE 0 = +-163.84 mV shunt range); the current
+// is worked out on the Pi from the shunt value the page is given.
+#define INA228_ADDRESS 0x4F
+bool ina228Read(uint8_t reg, uint8_t len, uint32_t &value) {
+  Wire.beginTransmission(INA228_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)INA228_ADDRESS, len) != len) return false;
+  value = 0;
+  for (uint8_t i = 0; i < len; i++) value = (value << 8) | Wire.read();
+  return true;
+}
+
+// 20-bit two's complement in bits 23..4 of a 24-bit register (VSHUNT, VBUS)
+int32_t ina228Signed20(uint32_t raw24) {
+  int32_t v = (int32_t)(raw24 >> 4);
+  if (v & 0x80000) v -= 0x100000;
+  return v;
+}
+
+void readVoltageMonitor() {
+  uint32_t manufacturer = 0, device = 0, vbusRaw = 0, vshuntRaw = 0, dieRaw = 0;
+  bool found = ina228Read(0x3E, 2, manufacturer) && ina228Read(0x3F, 2, device);
+  float vbusV = -99, vshuntMV = -99, dieTempC = -99;
+  if (found && ina228Read(0x05, 3, vbusRaw) && ina228Read(0x04, 3, vshuntRaw) && ina228Read(0x06, 2, dieRaw)) {
+    vbusV = ina228Signed20(vbusRaw) * 195.3125e-6f;      // 195.3125 uV/LSB
+    vshuntMV = ina228Signed20(vshuntRaw) * 312.5e-6f;    // 312.5 nV/LSB = 312.5e-6 mV, ADCRANGE 0
+    dieTempC = (int16_t)dieRaw * 7.8125e-3f;             // 7.8125 m°C/LSB
+  }
+  float ntcV = -99, v50V = -99;
+  if (ADS.isConnected()) {
+    ADS.setGain(0);
+    ntcV = ADS.readADC(1) * ADS.toVoltage(1);  // pin-18 terminal, ANALOG jumper
+    v50V = ADS.readADC(3) * ADS.toVoltage(1);  // AIN3 = V50 sense on the Daffodil shield
+  }
+  Serial.println("inaFound=" + String(found ? 1 : 0)
+                 + " manufacturerId=" + String(manufacturer, HEX)
+                 + " deviceId=" + String(device, HEX)
+                 + " vbusV=" + String(vbusV, 4)
+                 + " vshuntMV=" + String(vshuntMV, 5)
+                 + " inaDieTempC=" + String(dieTempC, 2)
+                 + " ntcV=" + String(ntcV, 4)
+                 + " v50V=" + String(v50V, 4));
+  Serial.println("Ok-ReadVoltageMonitor");
+  Serial.flush();
+}
 
 void pollUltrasonicSerial2() {
   while (ultrasonicSerial2.available()) {
@@ -1717,6 +1770,8 @@ void loop() {
         Serial.println("Failure-SetTestMode-unknown mode " + mode + " (use Flow or Ultrasonic)");
       }
       Serial.flush();
+    } else if (command.startsWith("ReadVoltageMonitor")) {
+      readVoltageMonitor();
     } else if (command.startsWith("ReadClipsal2US")) {  // before ReadClipsal, which it starts with
       readClipsal2US();
     } else if (command.startsWith("ReadClipsal")) {
