@@ -20,6 +20,8 @@
 #include <DataManager.h>
 #include <LittleFS.h>
 #include "ADS1X15.h"
+#include "OneWire.h"
+#include "DallasTemperature.h"
 bool gloriaTankFlowPumpNewData = false;
 bool digitalStablesDataNewData = false;
 bool chinampaDataNewData = false;
@@ -40,7 +42,10 @@ bool inPulse=false;
 // 1 = 2026-11-03: Nearby Devices map positions, Ping (signal survey), the first numbered build.
 // 2 = 2026-11-03: a factory product like the rest - GetProductDefinition / SetProductDefinition /
 //     GetSerialNumber (Inspect, deploy packages, Allocate Customer); plain "Ping" is Ok-Ping again.
-const int firmwareVersion = 2;
+// 3 = 2026-11-03: 150 ms for the power rails before the OLED is initialised (dark after a cold boot).
+// 4 = 2026-11-07: ReadClipsal / StopClipsal - PaulaDeployer's "Clipsal Uart" test (ultrasonic on 18 +
+//     DS18B20 water temperature on 33 through a ClipsallJunctionBoxWaterTrough board).
+const int firmwareVersion = 4;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -64,6 +69,17 @@ uint16_t lastUltrasonicDistanceMM = 0;
 unsigned long lastUltrasonicReadMillis = 0;
 uint8_t ultrasonicFrameBuf[4];
 uint8_t ultrasonicFrameBufLen = 0;
+
+// "Clipsal Uart" test (2026-11-07, PaulaDeployer's yellow Clipsal Uart button): a
+// ClipsallJunctionBoxWaterTrough board wired to Paula's terminals as it would be to a Daffodil in
+// DAFFODIL_WATER_TROUGH_WATER_TEMP mode - DYP-A02 UART TX on pin 18, waterproof DS18B20 on pin 33.
+// Same as Daffodil.ino's waterOneWire: no external pull-up, the shield's 2N7002 level shifter on the
+// pin-33 terminal (10k to V50 on the terminal side) is the bus pull-up, so the jumper must be on
+// DIGITAL. ReadClipsal takes pin 18 as ultrasonic UART and pin 33 off its flow interrupt;
+// StopClipsal (or SetTestMode#Flow) gives both back to the flow sensors.
+OneWire clipsalOneWire(33);  // SENSOR_INPUT_2, defined below
+DallasTemperature clipsalTempSensor(&clipsalOneWire);
+bool clipsalActive = false;
 
 #define SCK 14
 #define MOSI 13
@@ -296,6 +312,52 @@ void pollUltrasonicSerial() {
       }
     }
   }
+}
+
+void startUltrasonicMode();
+void startFlowMode();
+
+void endClipsal() {
+  if (!clipsalActive) return;
+  pinMode(SENSOR_INPUT_2, INPUT);
+  attachInterrupt(SENSOR_INPUT_2, pulseCounter2, FALLING);
+  clipsalActive = false;
+}
+
+// One reading of both sensors, printed as one key=value line. Waits up to 1.5 s for an ultrasonic
+// frame that arrived after the command (the DYP-A02 sends ~every 100-300 ms in automatic mode), and
+// re-scans the 1-Wire bus every time so a probe plugged in mid-test is found.
+void readClipsal() {
+  if (currentTestMode != TEST_MODE_ULTRASONIC) startUltrasonicMode();
+  if (!clipsalActive) {
+    detachInterrupt(SENSOR_INPUT_2);
+    clipsalActive = true;
+  }
+  unsigned long asked = millis();
+  while (millis() - asked < 1500 && (lastUltrasonicReadMillis == 0 || lastUltrasonicReadMillis < asked)) {
+    pollUltrasonicSerial();
+    delay(5);
+  }
+  bool freshFrame = lastUltrasonicReadMillis != 0 && lastUltrasonicReadMillis >= asked;
+
+  clipsalTempSensor.begin();
+  int probes = clipsalTempSensor.getDeviceCount();
+  float tempC = -99;
+  if (probes > 0) {
+    clipsalTempSensor.setResolution(10);  // 0.25°C, ~190 ms
+    clipsalTempSensor.setWaitForConversion(true);
+    clipsalTempSensor.requestTemperatures();
+    float t = clipsalTempSensor.getTempCByIndex(0);
+    if (t != DEVICE_DISCONNECTED) tempC = t;
+  }
+  pollUltrasonicSerial();  // drain what came in during the conversion
+
+  Serial.println("distanceMM=" + String(freshFrame ? lastUltrasonicDistanceMM : 0)
+                 + " ultrasonicOk=" + String(freshFrame ? 1 : 0)
+                 + " tempC=" + String(tempC, 2)
+                 + " tempProbes=" + String(probes));
+  Serial.println("Ok-ReadClipsal");
+  Serial.flush();
 }
 
 void onReceive(int packetSize) {
@@ -582,6 +644,23 @@ void processLora(int packetSize) {
 }
 
 
+// Pin 18 as the DYP-A02's UART RX (see ultrasonicSerial) / back to Flow Sensor 1's interrupt.
+void startUltrasonicMode() {
+  detachInterrupt(SENSOR_INPUT_1);
+  ultrasonicFrameBufLen = 0;
+  lastUltrasonicDistanceMM = 0;
+  lastUltrasonicReadMillis = 0;
+  ultrasonicSerial.begin(9600, SERIAL_8N1, SENSOR_INPUT_1, -1);
+  currentTestMode = TEST_MODE_ULTRASONIC;
+}
+
+void startFlowMode() {
+  if (currentTestMode == TEST_MODE_FLOW) return;
+  ultrasonicSerial.end();
+  attachInterrupt(SENSOR_INPUT_1, pulseCounter, FALLING);
+  currentTestMode = TEST_MODE_FLOW;
+}
+
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
@@ -610,6 +689,10 @@ void setup() {
   gpio_hold_dis((gpio_num_t)LED_CONTROL);
   pinMode(LED_CONTROL, OUTPUT);
   digitalWrite(LED_CONTROL, HIGH);
+  // Let the switched rails settle before the OLED is probed and initialised (2026-11-03): after the
+  // factory's flash (a cold boot) the screen stayed dark until a manual reset - an SSD1306 initialised
+  // before its supply is up ignores the init sequence.
+  delay(150);
 
   if(debug)Serial.print("DigitalStablesData size=");
   if(debug)Serial.println(sizeof(DigitalStablesData));
@@ -1551,25 +1634,22 @@ void loop() {
       // port accordingly. Flow Sensor 2 (pin 33) is unaffected either way.
       String mode = generalFunctions.getValue(command, '#', 1);
       if (mode == "Ultrasonic") {
-        if (currentTestMode != TEST_MODE_ULTRASONIC) {
-          detachInterrupt(SENSOR_INPUT_1);
-          ultrasonicFrameBufLen = 0;
-          lastUltrasonicDistanceMM = 0;
-          lastUltrasonicReadMillis = 0;
-          ultrasonicSerial.begin(9600, SERIAL_8N1, SENSOR_INPUT_1, -1);
-          currentTestMode = TEST_MODE_ULTRASONIC;
-        }
+        if (currentTestMode != TEST_MODE_ULTRASONIC) startUltrasonicMode();
         Serial.println("Ok-SetTestMode-Ultrasonic");
       } else if (mode == "Flow") {
-        if (currentTestMode != TEST_MODE_FLOW) {
-          ultrasonicSerial.end();
-          attachInterrupt(SENSOR_INPUT_1, pulseCounter, FALLING);
-          currentTestMode = TEST_MODE_FLOW;
-        }
+        startFlowMode();
+        endClipsal();
         Serial.println("Ok-SetTestMode-Flow");
       } else {
         Serial.println("Failure-SetTestMode-unknown mode " + mode + " (use Flow or Ultrasonic)");
       }
+      Serial.flush();
+    } else if (command.startsWith("ReadClipsal")) {
+      readClipsal();
+    } else if (command.startsWith("StopClipsal")) {
+      startFlowMode();
+      endClipsal();
+      Serial.println("Ok-StopClipsal");
       Serial.flush();
     } else if (command.startsWith("GetUltrasonicReading")) {
       if (currentTestMode != TEST_MODE_ULTRASONIC) {
