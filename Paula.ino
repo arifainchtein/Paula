@@ -369,7 +369,7 @@ void readVoltageMonitor() {
   if (ADS.isConnected()) {
     ADS.setGain(0);
     ntcV = ADS.readADC(1) * ADS.toVoltage(1);  // pin-18 terminal, ANALOG jumper
-    v50V = ADS.readADC(3) * ADS.toVoltage(1);  // AIN3 = V50 sense on the Daffodil shield
+    v50V = ADS.readADC(3) * ADS.toVoltage(1);  // AIN3 = V50_I (pre-diode input), only a guide to V50
   }
   Serial.println("inaFound=" + String(found ? 1 : 0)
                  + " manufacturerId=" + String(manufacturer, HEX)
