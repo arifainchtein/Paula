@@ -45,7 +45,9 @@ bool inPulse=false;
 // 3 = 2026-11-03: 150 ms for the power rails before the OLED is initialised (dark after a cold boot).
 // 4 = 2026-11-07: ReadClipsal / StopClipsal - PaulaDeployer's "Clipsal Uart" test (ultrasonic on 18 +
 //     DS18B20 water temperature on 33 through a ClipsallJunctionBoxWaterTrough board).
-const int firmwareVersion = 4;
+// 5 = 2026-11-07: ReadClipsal2US - "Clipsal 2US" test, two DYP-A02 UART ultrasonics (18 and 33) through a
+//     ClipsallJunctionBoxWaterTrough_2US board; the second one on UART1 (ultrasonicSerial2).
+const int firmwareVersion = 5;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -80,6 +82,17 @@ uint8_t ultrasonicFrameBufLen = 0;
 OneWire clipsalOneWire(33);  // SENSOR_INPUT_2, defined below
 DallasTemperature clipsalTempSensor(&clipsalOneWire);
 bool clipsalActive = false;
+
+// "Clipsal 2US" (2026-11-07): the ClipsallJunctionBoxWaterTrough_2US board has two DYP-A02s, one per
+// Grove socket - left socket (J1) on J2 "18", right socket (J7) on J2 "33", both RX unconnected so both
+// stream in automatic mode. The second one is read on UART1 with RX on pin 33 (same digital-jumper
+// level shifter as pin 18). Same 4-byte frame as ultrasonicSerial, parsed by its own buffer.
+HardwareSerial ultrasonicSerial2(1);
+bool clipsal2USActive = false;
+uint16_t lastUltrasonic2DistanceMM = 0;
+unsigned long lastUltrasonic2ReadMillis = 0;
+uint8_t ultrasonic2FrameBuf[4];
+uint8_t ultrasonic2FrameBufLen = 0;
 
 #define SCK 14
 #define MOSI 13
@@ -317,17 +330,77 @@ void pollUltrasonicSerial() {
 void startUltrasonicMode();
 void startFlowMode();
 
+void pollUltrasonicSerial2() {
+  while (ultrasonicSerial2.available()) {
+    uint8_t b = ultrasonicSerial2.read();
+    if (ultrasonic2FrameBufLen == 0) {
+      if (b == 0xFF) ultrasonic2FrameBuf[ultrasonic2FrameBufLen++] = b;
+    } else {
+      ultrasonic2FrameBuf[ultrasonic2FrameBufLen++] = b;
+      if (ultrasonic2FrameBufLen == 4) {
+        uint8_t sum = (ultrasonic2FrameBuf[0] + ultrasonic2FrameBuf[1] + ultrasonic2FrameBuf[2]) & 0xFF;
+        if (sum == ultrasonic2FrameBuf[3]) {
+          lastUltrasonic2DistanceMM = (ultrasonic2FrameBuf[1] << 8) | ultrasonic2FrameBuf[2];
+          lastUltrasonic2ReadMillis = millis();
+        }
+        ultrasonic2FrameBufLen = 0;
+      }
+    }
+  }
+}
+
+// Gives pin 33 back to Flow Sensor 2, from either Clipsal test (OneWire or the second UART).
 void endClipsal() {
+  if (clipsal2USActive) {
+    ultrasonicSerial2.end();
+    clipsal2USActive = false;
+  }
   if (!clipsalActive) return;
   pinMode(SENSOR_INPUT_2, INPUT);
   attachInterrupt(SENSOR_INPUT_2, pulseCounter2, FALLING);
   clipsalActive = false;
 }
 
+// One reading of both ultrasonics: waits up to 1.5 s for a frame from each that arrived after the
+// command. distance1 = pin 18 (left Grove, J2 "18"), distance2 = pin 33 (right Grove, J2 "33").
+void readClipsal2US() {
+  if (currentTestMode != TEST_MODE_ULTRASONIC) startUltrasonicMode();
+  if (!clipsalActive) {
+    detachInterrupt(SENSOR_INPUT_2);
+    clipsalActive = true;
+  }
+  if (!clipsal2USActive) {
+    ultrasonic2FrameBufLen = 0;
+    lastUltrasonic2DistanceMM = 0;
+    lastUltrasonic2ReadMillis = 0;
+    ultrasonicSerial2.begin(9600, SERIAL_8N1, SENSOR_INPUT_2, -1);
+    clipsal2USActive = true;
+  }
+  unsigned long asked = millis();
+  bool fresh1 = false, fresh2 = false;
+  while (millis() - asked < 1500 && !(fresh1 && fresh2)) {
+    pollUltrasonicSerial();
+    pollUltrasonicSerial2();
+    fresh1 = lastUltrasonicReadMillis != 0 && lastUltrasonicReadMillis >= asked;
+    fresh2 = lastUltrasonic2ReadMillis != 0 && lastUltrasonic2ReadMillis >= asked;
+    delay(5);
+  }
+  Serial.println("distance1MM=" + String(fresh1 ? lastUltrasonicDistanceMM : 0)
+                 + " ultrasonic1Ok=" + String(fresh1 ? 1 : 0)
+                 + " distance2MM=" + String(fresh2 ? lastUltrasonic2DistanceMM : 0)
+                 + " ultrasonic2Ok=" + String(fresh2 ? 1 : 0));
+  Serial.println("Ok-ReadClipsal2US");
+  Serial.flush();
+}
+
 // One reading of both sensors, printed as one key=value line. Waits up to 1.5 s for an ultrasonic
 // frame that arrived after the command (the DYP-A02 sends ~every 100-300 ms in automatic mode), and
 // re-scans the 1-Wire bus every time so a probe plugged in mid-test is found.
 void readClipsal() {
+  if (clipsal2USActive) {  // pin 33 was the second ultrasonic's UART - give it to OneWire
+    ultrasonicSerial2.end();
+    clipsal2USActive = false;
+  }
   if (currentTestMode != TEST_MODE_ULTRASONIC) startUltrasonicMode();
   if (!clipsalActive) {
     detachInterrupt(SENSOR_INPUT_2);
@@ -1644,6 +1717,8 @@ void loop() {
         Serial.println("Failure-SetTestMode-unknown mode " + mode + " (use Flow or Ultrasonic)");
       }
       Serial.flush();
+    } else if (command.startsWith("ReadClipsal2US")) {  // before ReadClipsal, which it starts with
+      readClipsal2US();
     } else if (command.startsWith("ReadClipsal")) {
       readClipsal();
     } else if (command.startsWith("StopClipsal")) {
