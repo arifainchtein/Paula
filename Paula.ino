@@ -56,7 +56,8 @@ bool inPulse=false;
 // 9 = 2026-11-10: relay mode (Relay#1/#0 - resends what it hears to Annabelle, for testing a relay
 //     spot) and the channel's noise level where Paula stands (GetNoise, and in GetNearbyDevices).
 //     Also (2026-11-11): ScanI2C (lists what answers on the I2C bus - to see whether the OLED is there)
-//     and Help / ListCommands (lists the serial commands).
+//     and Help / ListCommands (lists the serial commands). OLED_SMALL: a 0.91" 128x32 screen that
+//     shows the name of each device heard, big (showHeard).
 const int firmwareVersion = 9;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -119,8 +120,17 @@ uint8_t ultrasonic2FrameBufLen = 0;
 #include "SHTSensor.h"
 
 // Display settings for 2.4" SSD1309
+// OLED_SMALL 1 = a 0.91" 128x32 OLED (2026-11-11: Paula's 0.96" 128x64 died, the 0.91" is what's on hand).
+// Too small for the detailed pages, so it only shows who Paula just heard over LoRa - the device's
+// name in big letters, then its RSSI/SNR and the time (showHeard). 0 = the 128x64 screens as before.
+#define OLED_SMALL 1
 #define SCREEN_WIDTH 128
+#if OLED_SMALL
+#define SCREEN_HEIGHT 32
+#else
 #define SCREEN_HEIGHT 64
+#endif
+const bool oledDetailed = !OLED_SMALL;  // the 128x64 pages (Chinampa, weather, DigitalStablesData, Unidentified)
 #define OLED_RESET -1        // Reset pin (-1 if sharing Arduino reset pin)
 #define SCREEN_ADDRESS 0x3C  // default; setup() uses 0x3D instead when that is where the OLED answers
 #define SLEEP_SWITCH_26 26
@@ -558,6 +568,40 @@ uint8_t xorChecksum(const void *data, size_t size, size_t checksumOffset) {
   return c;
 }
 
+// Who Paula heard last (2026-11-11) - set in processLora for every packet, drawn by showHeard() on
+// the OLED_SMALL screen.
+char lastHeardName[17] = "";
+char lastHeardType[12] = "";
+int lastHeardRssi = 0;
+float lastHeardSnr = 0;
+bool lastHeardNew = false;
+
+// Name a packet without one (VitalSigns, LinkHealth) carries: the name its data packets gave, else
+// the first 6 hex digits of its serial.
+void noteHeard(const char *name, size_t nameLen, const uint8_t *serial, const char *type) {
+  memset(lastHeardName, 0, sizeof(lastHeardName));
+  if (name && name[0]) {
+    size_t n = strnlen(name, nameLen);
+    if (n > sizeof(lastHeardName) - 1) n = sizeof(lastHeardName) - 1;
+    memcpy(lastHeardName, name, n);
+  } else if (serial) {
+    for (int i = 0; i < NEARBY_MAX; i++) {
+      if (nearby[i].lastMs && memcmp(nearby[i].serial, serial, 8) == 0 && nearby[i].name[0]) {
+        strncpy(lastHeardName, nearby[i].name, sizeof(lastHeardName) - 1);
+        break;
+      }
+    }
+    if (!lastHeardName[0]) snprintf(lastHeardName, sizeof(lastHeardName), "%02X%02X%02X", serial[0], serial[1], serial[2]);
+  } else {
+    strncpy(lastHeardName, "Unknown", sizeof(lastHeardName) - 1);
+  }
+  strncpy(lastHeardType, type, sizeof(lastHeardType) - 1);
+  lastHeardType[sizeof(lastHeardType) - 1] = 0;
+  lastHeardRssi = LoRa.packetRssi();
+  lastHeardSnr = LoRa.packetSnr();
+  lastHeardNew = true;
+}
+
 // The device's slot: its own, else a free one, else the least recently heard.
 NearbyDevice &nearbySlot(const uint8_t *serial) {
   int slot = -1, oldest = 0;
@@ -846,6 +890,7 @@ void processLora(int packetSize) {
 
     langleyData.rssi = LoRa.packetRssi();
     langleyData.snr = LoRa.packetSnr();
+    noteHeard(langleyData.devicename, sizeof(langleyData.devicename), NULL, "Langley");
     if (loraSniffer) printSniff("LangleyData", packetSize, langleyData.rssi, langleyData.snr, langleyData.devicename, sizeof(langleyData.devicename), langleyData.serialnumberarray, -1, langleyData.latitude, langleyData.longitude);
 
 
@@ -861,6 +906,7 @@ void processLora(int packetSize) {
 
     gloriaTankFlowPumpData.rssi = LoRa.packetRssi();
     gloriaTankFlowPumpData.snr = LoRa.packetSnr();
+    noteHeard(gloriaTankFlowPumpData.devicename, sizeof(gloriaTankFlowPumpData.devicename), NULL, "Gloria");
     if (loraSniffer) printSniff("GloriaTankFlowPumpData", packetSize, gloriaTankFlowPumpData.rssi, gloriaTankFlowPumpData.snr, gloriaTankFlowPumpData.devicename, sizeof(gloriaTankFlowPumpData.devicename), gloriaTankFlowPumpData.serialnumberarray, -1, gloriaTankFlowPumpData.latitude, gloriaTankFlowPumpData.longitude);
 
 
@@ -873,6 +919,7 @@ void processLora(int packetSize) {
     chinampaData.rssi = LoRa.packetRssi();
     chinampaData.snr = LoRa.packetSnr();
     noteNearbyChinampa(chinampaData);
+    noteHeard(chinampaData.devicename, sizeof(chinampaData.devicename), NULL, "Chinampa");
     if (loraSniffer) printSniff("ChinampaData", packetSize, chinampaData.rssi, chinampaData.snr, chinampaData.devicename, sizeof(chinampaData.devicename), chinampaData.serialnumberarray, -1, chinampaData.latitude, chinampaData.longitude);
     //if(debug)
     if (debug) Serial.print("received chinampaData from ");
@@ -893,6 +940,7 @@ void processLora(int packetSize) {
     if (dsChecksumOk) noteRelayCandidate(loraRxRaw, sizeof(DigitalStablesData), true);
     digitalStablesData.rssi = LoRa.packetRssi();
     digitalStablesData.snr = LoRa.packetSnr();
+    noteHeard(digitalStablesData.devicename, sizeof(digitalStablesData.devicename), NULL, dsChecksumOk ? "Data" : "Data bad");
     if (loraSniffer) printSniff("DigitalStablesData", packetSize, digitalStablesData.rssi, digitalStablesData.snr, digitalStablesData.devicename, sizeof(digitalStablesData.devicename), digitalStablesData.serialnumberarray, dsChecksumOk, digitalStablesData.latitude, digitalStablesData.longitude);
     dataManager.storeDigitalStablesData(digitalStablesData);
      dataManager.printDigitalStablesData(digitalStablesData);
@@ -931,6 +979,7 @@ void processLora(int packetSize) {
       deviceCommandQueue.noteVitalSigns(vs.serialnumberarray, millis());
       noteRelayCandidate((const uint8_t *)&vs, sizeof(vs), false);
     }
+    noteHeard(NULL, 0, vs.serialnumberarray, "Vitals");
     if (loraSniffer) printSniff("VitalSignsRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, vs.serialnumberarray, vsOk, NAN, NAN);
   } else if (packetSize == sizeof(VitalSignsRecordV3)) {
     // Version 3 (89 bytes) from a Daffodil not yet on v4 - the serial is in the same place.
@@ -940,11 +989,13 @@ void processLora(int packetSize) {
     if (vs3Ok) {
       deviceCommandQueue.noteVitalSigns(vitalSignsFromV3(vs3).serialnumberarray, millis());
     }
+    noteHeard(NULL, 0, vitalSignsFromV3(vs3).serialnumberarray, "Vitals");
     if (loraSniffer) printSniff("VitalSignsRecordV3", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, vitalSignsFromV3(vs3).serialnumberarray, vs3Ok, NAN, NAN);
   } else if (packetSize == sizeof(WeatherForecastUpdate)) {
     WeatherForecastUpdate wfu;
     LoRa.readBytes((uint8_t*)&wfu, sizeof(WeatherForecastUpdate));
     bool validCode = secretManager.checkCode(wfu.totpcode);
+    noteHeard("Weather", 8, NULL, "Forecast");
     if (loraSniffer) printSniff("WeatherForecastUpdate", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, NULL, validCode, NAN, NAN);
     if (validCode) {
       for (int i = 0; i < 4; i++) storedForecasts[i] = wfu.forecasts[i];
@@ -963,6 +1014,7 @@ void processLora(int packetSize) {
 
     seedlingMonitorData.rssi = LoRa.packetRssi();
     seedlingMonitorData.snr = LoRa.packetSnr();
+    noteHeard(seedlingMonitorData.devicename, sizeof(seedlingMonitorData.devicename), NULL, "Seedling");
     if (loraSniffer) printSniff("SeedlingMonitorData", packetSize, seedlingMonitorData.rssi, seedlingMonitorData.snr, seedlingMonitorData.devicename, sizeof(seedlingMonitorData.devicename), seedlingMonitorData.serialnumberarray, -1, NAN, NAN);
     //if(debug)
     if (debug) Serial.print("received SeedlingMonitorData from ");
@@ -974,13 +1026,23 @@ void processLora(int packetSize) {
     LoRa.readBytes((uint8_t*)&lh, sizeof(LinkHealthRecord));
     bool lhOk = linkHealthValid(lh);
     if (lhOk) noteRelayCandidate((const uint8_t *)&lh, sizeof(lh), false);
+    noteHeard(NULL, 0, lh.serialnumberarray, "LinkHlth");
     if (loraSniffer) printSniff("LinkHealthRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, lh.serialnumberarray, lhOk, NAN, NAN);
   } else if (packetSize == sizeof(LinkAckRecord)) {
     // An answer to Paula's ping (sendPing) - for the map; printed whether or not the sniffer is on.
     LinkAckRecord ack;
     LoRa.readBytes((uint8_t*)&ack, sizeof(LinkAckRecord));
     printLinkAck(ack, packetSize, LoRa.packetRssi(), LoRa.packetSnr());
-  } else if (loraSniffer) {
+    noteHeard(NULL, 0, ack.serialnumberarray, "PingAck");
+  } else {
+    char unknown[17];
+    snprintf(unknown, sizeof(unknown), "%d bytes", packetSize);
+    noteHeard(unknown, sizeof(unknown), NULL, "Unknown");
+  }
+  if (packetSize != sizeof(LangleyData) && packetSize != sizeof(GloriaTankFlowPumpData) && packetSize != sizeof(ChinampaData)
+      && packetSize != sizeof(DigitalStablesData) && packetSize != sizeof(VitalSignsRecord) && packetSize != sizeof(VitalSignsRecordV3)
+      && packetSize != sizeof(WeatherForecastUpdate) && packetSize != sizeof(SeedlingMonitorData) && packetSize != sizeof(LinkHealthRecord)
+      && packetSize != sizeof(LinkAckRecord) && loraSniffer) {
     // A size Paula has no struct for - shown raw, so new/foreign senders are still visible.
     uint8_t raw[256];
     int n = LoRa.readBytes(raw, packetSize < (int)sizeof(raw) ? packetSize : (int)sizeof(raw));
@@ -1180,6 +1242,23 @@ bool doit = true;
 // "Paula", the firmware version and build time - the way to see which build is flashed - under a
 // one-line status. Drawn and shown at once.
 void showVersionBanner(const char *status) {
+#if OLED_SMALL
+  // 128x32: status small on top, "Paula v9" big below
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  centerText(status, 0);
+  display.setTextSize(2);
+  {
+    String big = "Paula v" + String(firmwareVersion);
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(big, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((SCREEN_WIDTH - w) / 2, 14);
+    display.print(big);
+  }
+  display.display();
+  return;
+#endif
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   centerText(status, 0);
@@ -1209,6 +1288,32 @@ void centerText(String text, int y) {
 
   display.setCursor(x, y);
   display.print(text);
+}
+
+// OLED_SMALL (128x32): who Paula just heard - the name as big as it fits, since that is what has to
+// be read at arm's length. Rows 0-23 the name: text size 3 (18x24 px, 7 characters) when it fits,
+// else size 2 (12x16, 10 characters), else size 1; row 24-31 one small line, RSSI and time:
+//   CHINAMPA          <- size 3 up to 7 chars ("Chinamp" - "Chinampa" is 8, so size 2)
+//   -118dBm 14:03:22
+void showHeard() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+  int16_t x1, y1;
+  uint16_t w, h;
+  size_t len = strlen(lastHeardName);
+  uint8_t size = len <= 7 ? 3 : (len <= 10 ? 2 : 1);
+  display.setTextSize(size);
+  display.getTextBounds(lastHeardName, 0, 0, &x1, &y1, &w, &h);
+  int y = (24 - (int)h) / 2;  // centred in rows 0-23
+  if (y < 0) y = 0;
+  display.setCursor((SCREEN_WIDTH - (int)w) / 2, y);
+  display.print(lastHeardName);
+  char line[22];
+  snprintf(line, sizeof(line), "%ddBm %02d:%02d:%02d", lastHeardRssi, currentTimerRecord.hour,
+           currentTimerRecord.minute, currentTimerRecord.second);
+  centerText(line, 24);
+  display.display();
 }
 
 // R display: < 1.0 → ".75" style decimal, >= 1.0 → rounded integer right-justified in 3 chars
@@ -1489,7 +1594,13 @@ void loop() {
 
 
 
-  if (!switchPositionLeft) {
+  if (!oledDetailed) {
+    // OLED_SMALL: only the last device heard, redrawn when a new packet came in
+    if (lastHeardNew) {
+      lastHeardNew = false;
+      showHeard();
+    }
+  } else if (!switchPositionLeft) {
     showWeatherForecast();
   } else if (displayingChinampa && refreshChinampaPage) {
     showChinampaPage1();
@@ -1594,7 +1705,7 @@ void loop() {
         dataManager.printDigitalStablesData(digitalStablesData);
         float rssi = digitalStablesData.rssi;
         float snr = digitalStablesData.snr;
-        if (switchPositionLeft) {
+        if (oledDetailed && switchPositionLeft) {
           display.clearDisplay();
           centerText(digitalStablesData.devicename, 0);
           display.setTextSize(1);    // Switch to smaller text
@@ -1670,7 +1781,7 @@ void loop() {
       if (weatherForecastNewData) {
         leds[4] = leds[5] = CRGB(0, 100, 255);
         FastLED.show();
-        showWeatherForecast();
+        if (oledDetailed) showWeatherForecast();
         weatherForecastNewData = false;
       }
     } else if (loraPacketSize == sizeof(ChinampaData)) {
@@ -1681,7 +1792,9 @@ void loop() {
       //if(debug)
       if (debug) Serial.println(chinampaData.devicename);
 
-      if (switchPositionLeft) showChinampaPage1();
+      if (!oledDetailed) {
+        // OLED_SMALL: showHeard() draws it
+      } else if (switchPositionLeft) showChinampaPage1();
       else showWeatherForecast();
 
 
@@ -1699,7 +1812,7 @@ void loop() {
       if(debug)Serial.println(chinampaData.snr);
       //  delay(500);
     } else if (loraPacketSize > 0) {
-      if (switchPositionLeft) {
+      if (oledDetailed && switchPositionLeft) {
         display.clearDisplay();
         centerText("Unidentified", 0);
 
