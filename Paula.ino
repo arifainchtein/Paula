@@ -57,7 +57,8 @@ bool inPulse=false;
 //     spot) and the channel's noise level where Paula stands (GetNoise, and in GetNearbyDevices).
 //     Also (2026-11-11): ScanI2C (lists what answers on the I2C bus - to see whether the OLED is there)
 //     and Help / ListCommands (lists the serial commands). OLED_SMALL: a 0.91" 128x32 screen that
-//     shows the name of each device heard, big (showHeard).
+//     shows the name of each device heard, big (showHeard). Relayed DigitalStablesData/ChinampaData
+//     carry sentbyarray "Paula".
 const int firmwareVersion = 9;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -712,6 +713,9 @@ void printNoiseJson() {
 uint32_t relayHash(const uint8_t *p, size_t len, bool isDsd) {
   uint32_t h = 2166136261u;
   for (size_t i = 0; i < len; i++) {
+    // sentbyarray and so the checksum change at every hop (Chinampa "Chinamp", Paula "Paula") - both
+    // left out, or Paula would take Chinampa's resend of her own relay for a new packet (2026-11-11)
+    if (isDsd && i == offsetof(DigitalStablesData, checksum)) continue;
     if (isDsd && ((i >= offsetof(DigitalStablesData, sentbyarray) && i < offsetof(DigitalStablesData, sentbyarray) + 8) ||
                   (i >= offsetof(DigitalStablesData, rssi) && i < offsetof(DigitalStablesData, snr) + sizeof(float)))) continue;
     h ^= p[i];
@@ -723,6 +727,13 @@ uint32_t relayHash(const uint8_t *p, size_t len, bool isDsd) {
 // A packet as received: queued for resending if relay mode is on and it hasn't been relayed already.
 void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd) {
   if (!relayOn || len > NEARBY_RAW_MAX) return;
+  // Already relayed by someone (sentbyarray set - Chinampa's "Chinamp"): not sent again, same rule as
+  // Chinampa's relay, so two relays can't bounce a packet between them (2026-11-11).
+  if (len == sizeof(DigitalStablesData) || len == sizeof(ChinampaData)) {
+    const uint8_t *sb = p + (len == sizeof(DigitalStablesData) ? offsetof(DigitalStablesData, sentbyarray)
+                                                                 : offsetof(ChinampaData, sentbyarray));
+    for (int i = 0; i < 8; i++) if (sb[i]) return;
+  }
   relayHeard++;
   uint32_t h = relayHash(p, len, isDsd), now = millis();
   for (int i = 0; i < RELAY_SEEN; i++) {
@@ -737,6 +748,21 @@ void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd) {
     relayQueue[i].waits = 0;
     relayQueue[i].dueMs = now + random(150, 650);
     memcpy(relayQueue[i].bytes, p, len);
+    // Mark the copy as relayed (2026-11-11): sentbyarray = "Paula", the field Chinampa already fills
+    // ("Chinamp") when it resends a Daffodil - Annabelle shows it, so a relayed packet can be told
+    // from one she heard directly. DigitalStablesData's checksum covers sentbyarray, so it is
+    // recomputed; ChinampaData's checksum isn't used by anyone (Annabelle checks its name only).
+    // VitalSigns / LinkHealth have no sentby field and go out unchanged.
+    if (len == sizeof(DigitalStablesData)) {
+      DigitalStablesData *d = (DigitalStablesData *)relayQueue[i].bytes;
+      memset(d->sentbyarray, 0, sizeof(d->sentbyarray));
+      memcpy(d->sentbyarray, "Paula", 5);
+      d->checksum = xorChecksum(d, sizeof(DigitalStablesData), offsetof(DigitalStablesData, checksum));
+    } else if (len == sizeof(ChinampaData)) {
+      ChinampaData *c = (ChinampaData *)relayQueue[i].bytes;
+      memset(c->sentbyarray, 0, sizeof(c->sentbyarray));
+      memcpy(c->sentbyarray, "Paula", 5);
+    }
     return;
   }
   relayDropped++;  // queue full
