@@ -15,6 +15,7 @@
 #include <DeviceCommandRecord.h>
 #include <DeviceCommandQueue.h>
 #include <LinkAckRecord.h>
+#include <LinkHealthRecord.h>  // relayed (2026-11-10), see the relay section
 //#include <Arduino_JSON.h>
 #include <Wire.h>
 #include <DataManager.h>
@@ -52,7 +53,11 @@ bool inPulse=false;
 // 7 = 2026-11-07: ReadVoltageMonitor reads the NTC on AIN0 (pin-33 terminal, JP5) per the board's spec.
 // 8 = 2026-11-10: Nearby Devices keeps each device's last packet as received (GetNearbyPacket - the
 //     page's "Data" button, which also checks the packet's layout) and lists Chinampa too.
-const int firmwareVersion = 8;
+// 9 = 2026-11-10: relay mode (Relay#1/#0 - resends what it hears to Annabelle, for testing a relay
+//     spot) and the channel's noise level where Paula stands (GetNoise, and in GetNearbyDevices).
+//     Also (2026-11-11): ScanI2C (lists what answers on the I2C bus - to see whether the OLED is there)
+//     and Help / ListCommands (lists the serial commands).
+const int firmwareVersion = 9;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -211,6 +216,40 @@ struct NearbyDevice {
 uint8_t loraRxRaw[NEARBY_RAW_MAX];  // the packet being processed, before rssi/snr are written into it
 static_assert(sizeof(DigitalStablesData) <= NEARBY_RAW_MAX && sizeof(ChinampaData) <= NEARBY_RAW_MAX,
               "NEARBY_RAW_MAX must hold every packet the Nearby list keeps");
+
+// ---- Relay mode (2026-11-10) ----
+// For testing whether a spot would make a good relay: Paula, placed between a device and Annabelle,
+// resends the data packets it hears so Annabelle gets a second chance at them. Chinampa first - its
+// direct link to Annabelle has no margin (see the "LoRa Link-Health Diagnosis" doc). Off at every boot.
+//   Relayed: ChinampaData, DigitalStablesData, VitalSignsRecord, LinkHealthRecord - byte for byte, so
+//   Annabelle can't tell a relayed packet from the original (the Pi stores a reading once anyway).
+//   Never twice: the last RELAY_SEEN packets are remembered by a hash of their bytes. For
+//   DigitalStablesData the hash leaves out sentbyarray/rssi/snr, so Chinampa's own repeat of a Fish
+//   Tank or Sump packet counts as the same packet and Paula and Chinampa can't keep bouncing it.
+//   When: 150-650 ms after hearing it (random, so two relays don't collide), and not while the
+//   channel reads more than RELAY_BUSY_DB over its noise level (up to 3 waits of 300 ms, then anyway).
+#define RELAY_QUEUE 4
+#define RELAY_SEEN 32
+#define RELAY_SEEN_MS (10UL * 60UL * 1000UL)
+#define RELAY_BUSY_DB 12
+struct RelaySlot { uint16_t len; uint8_t waits; uint32_t dueMs; uint8_t bytes[NEARBY_RAW_MAX]; };
+bool relayOn = false;
+RelaySlot relayQueue[RELAY_QUEUE];  // len 0 = free
+uint32_t relaySeenHash[RELAY_SEEN];
+uint32_t relaySeenMs[RELAY_SEEN];
+uint8_t relaySeenNext = 0;
+uint32_t relayHeard = 0, relaySent = 0, relayDup = 0, relayDropped = 0;
+static_assert(sizeof(VitalSignsRecord) <= NEARBY_RAW_MAX && sizeof(LinkHealthRecord) <= NEARBY_RAW_MAX,
+              "a relay slot must hold every packet type relayed");
+
+// ---- Noise where Paula stands (2026-11-10) ----
+// The channel's RSSI once a second while nothing is being received - the last NOISE_SAMPLES seconds.
+// A rise here is interference (2026-11-08: Annabelle's noise rose ~10 dB and Chinampa dropped out);
+// walking around with Paula and watching it finds the source.
+#define NOISE_SAMPLES 60
+int16_t noiseRing[NOISE_SAMPLES];
+uint8_t noiseCount = 0, noiseNext = 0;
+int16_t noiseNow = 0;
 NearbyDevice nearby[NEARBY_MAX];
 DeviceCommandQueue deviceCommandQueue;
 // The LoRa "L" (LEDs 1, 6, 11, 12 - same glyph as Daffodil's drawLora) flashed for a WiFi command:
@@ -594,6 +633,101 @@ bool printNearbyPacket(const String &serialHex) {
   return false;
 }
 
+// ---- noise ----
+void noteNoiseSample(int rssi) {
+  noiseNow = rssi;
+  noiseRing[noiseNext] = rssi;
+  noiseNext = (noiseNext + 1) % NOISE_SAMPLES;
+  if (noiseCount < NOISE_SAMPLES) noiseCount++;
+}
+
+// min / median / max of the last NOISE_SAMPLES seconds; false = no samples yet
+bool noiseStats(int &mn, int &med, int &mx) {
+  if (!noiseCount) return false;
+  int16_t v[NOISE_SAMPLES];
+  memcpy(v, noiseRing, noiseCount * sizeof(int16_t));
+  for (int i = 1; i < noiseCount; i++) {  // insertion sort, 60 values
+    int16_t x = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = x;
+  }
+  mn = v[0];
+  mx = v[noiseCount - 1];
+  med = v[noiseCount / 2];
+  return true;
+}
+
+void printNoiseJson() {
+  int mn, med, mx;
+  if (noiseStats(mn, med, mx)) Serial.printf("{\"now\":%d,\"min\":%d,\"median\":%d,\"max\":%d,\"samples\":%u}", noiseNow, mn, med, mx, noiseCount);
+  else Serial.print("{\"samples\":0}");
+}
+
+// ---- relay ----
+uint32_t relayHash(const uint8_t *p, size_t len, bool isDsd) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    if (isDsd && ((i >= offsetof(DigitalStablesData, sentbyarray) && i < offsetof(DigitalStablesData, sentbyarray) + 8) ||
+                  (i >= offsetof(DigitalStablesData, rssi) && i < offsetof(DigitalStablesData, snr) + sizeof(float)))) continue;
+    h ^= p[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+// A packet as received: queued for resending if relay mode is on and it hasn't been relayed already.
+void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd) {
+  if (!relayOn || len > NEARBY_RAW_MAX) return;
+  relayHeard++;
+  uint32_t h = relayHash(p, len, isDsd), now = millis();
+  for (int i = 0; i < RELAY_SEEN; i++) {
+    if (relaySeenMs[i] && relaySeenHash[i] == h && now - relaySeenMs[i] < RELAY_SEEN_MS) { relayDup++; return; }
+  }
+  relaySeenHash[relaySeenNext] = h;
+  relaySeenMs[relaySeenNext] = now ? now : 1;
+  relaySeenNext = (relaySeenNext + 1) % RELAY_SEEN;
+  for (int i = 0; i < RELAY_QUEUE; i++) {
+    if (relayQueue[i].len) continue;
+    relayQueue[i].len = len;
+    relayQueue[i].waits = 0;
+    relayQueue[i].dueMs = now + random(150, 650);
+    memcpy(relayQueue[i].bytes, p, len);
+    return;
+  }
+  relayDropped++;  // queue full
+}
+
+// From loop(): sends the queued packets whose time has come.
+void serviceRelay() {
+  for (int i = 0; i < RELAY_QUEUE; i++) {
+    RelaySlot &r = relayQueue[i];
+    if (!r.len || (int32_t)(millis() - r.dueMs) < 0) continue;
+    if (loraReceived) return;  // a packet is waiting to be read - that first
+    int mn, med, mx;
+    if (r.waits < 3 && noiseStats(mn, med, mx) && LoRa.rssi() > med + RELAY_BUSY_DB) {
+      r.waits++;
+      r.dueMs = millis() + 300;  // someone is transmitting - wait
+      continue;
+    }
+    LoRa_txMode();
+    LoRa.beginPacket();
+    LoRa.write(r.bytes, r.len);
+    bool ok = LoRa.endPacket();
+    LoRa_rxMode();
+    if (ok) relaySent++;
+    if (debug) Serial.printf("relayed %u bytes: %s\n", r.len, ok ? "ok" : "failed");
+    r.len = 0;
+  }
+}
+
+void printRelayJson() {
+  int queued = 0;
+  for (int i = 0; i < RELAY_QUEUE; i++) if (relayQueue[i].len) queued++;
+  Serial.printf("{\"on\":%s,\"heard\":%lu,\"sent\":%lu,\"dup\":%lu,\"dropped\":%lu,\"queued\":%d}", relayOn ? "true" : "false",
+                (unsigned long)relayHeard, (unsigned long)relaySent, (unsigned long)relayDup, (unsigned long)relayDropped, queued);
+}
+
 void flashLoraL(CRGB color) {
   for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
   leds[1] = leds[6] = leds[11] = leds[12] = color;
@@ -691,7 +825,11 @@ void printNearbyDevices() {
     }
     Serial.print("}");
   }
-  Serial.println("]}");
+  Serial.print("],\"noise\":");
+  printNoiseJson();
+  Serial.print(",\"relay\":");
+  printRelayJson();
+  Serial.println("}");
 }
 
 void processLora(int packetSize) {
@@ -731,6 +869,7 @@ void processLora(int packetSize) {
     LoRa.readBytes((uint8_t*)&chinampaData, sizeof(ChinampaData));
     memcpy(loraRxRaw, &chinampaData, sizeof(ChinampaData));  // as received, for the Data button
 
+    noteRelayCandidate(loraRxRaw, sizeof(ChinampaData), false);
     chinampaData.rssi = LoRa.packetRssi();
     chinampaData.snr = LoRa.packetSnr();
     noteNearbyChinampa(chinampaData);
@@ -751,6 +890,7 @@ void processLora(int packetSize) {
     bool dsChecksumOk = xorChecksum(&digitalStablesData, sizeof(DigitalStablesData), offsetof(DigitalStablesData, checksum))
                         == digitalStablesData.checksum;
     digitalStablesDataNewData = true;
+    if (dsChecksumOk) noteRelayCandidate(loraRxRaw, sizeof(DigitalStablesData), true);
     digitalStablesData.rssi = LoRa.packetRssi();
     digitalStablesData.snr = LoRa.packetSnr();
     if (loraSniffer) printSniff("DigitalStablesData", packetSize, digitalStablesData.rssi, digitalStablesData.snr, digitalStablesData.devicename, sizeof(digitalStablesData.devicename), digitalStablesData.serialnumberarray, dsChecksumOk, digitalStablesData.latitude, digitalStablesData.longitude);
@@ -789,6 +929,7 @@ void processLora(int packetSize) {
     bool vsOk = xorChecksum(&vs, sizeof(vs), offsetof(VitalSignsRecord, checksum)) == vs.checksum;
     if (vsOk) {
       deviceCommandQueue.noteVitalSigns(vs.serialnumberarray, millis());
+      noteRelayCandidate((const uint8_t *)&vs, sizeof(vs), false);
     }
     if (loraSniffer) printSniff("VitalSignsRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, vs.serialnumberarray, vsOk, NAN, NAN);
   } else if (packetSize == sizeof(VitalSignsRecordV3)) {
@@ -826,6 +967,14 @@ void processLora(int packetSize) {
     //if(debug)
     if (debug) Serial.print("received SeedlingMonitorData from ");
     if (debug) Serial.println(seedlingMonitorData.devicename);
+  } else if (packetSize == sizeof(LinkHealthRecord)) {
+    // A device's report on its own link (Chinampa) - Paula only relays it, so Annabelle still gets it
+    // when the device can't reach her itself.
+    LinkHealthRecord lh;
+    LoRa.readBytes((uint8_t*)&lh, sizeof(LinkHealthRecord));
+    bool lhOk = linkHealthValid(lh);
+    if (lhOk) noteRelayCandidate((const uint8_t *)&lh, sizeof(lh), false);
+    if (loraSniffer) printSniff("LinkHealthRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, lh.serialnumberarray, lhOk, NAN, NAN);
   } else if (packetSize == sizeof(LinkAckRecord)) {
     // An answer to Paula's ping (sendPing) - for the map; printed whether or not the sniffer is on.
     LinkAckRecord ack;
@@ -1327,6 +1476,7 @@ void loop() {
     clockTicked = false;
     portEXIT_CRITICAL(&mux);
     currentTimerRecord = timeManager.now();
+    if (loraActive && !loraReceived) noteNoiseSample(LoRa.rssi());  // the channel's noise here
     lastLoraReceptionSeconds++;
     lastWeatherForecastSeconds++;
     leds[4] = CRGB(0, 0, 0);
@@ -1360,6 +1510,7 @@ void loop() {
     leds[3] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
     FastLED.show();
   }
+  serviceRelay();
   if (loraReceived) {
     //Serial.printf("lora recive Free Heap: %d \n", xPortGetFreeHeapSize());
     if (debug) Serial.printf("lora recive loraPacketSize: %d \n", loraPacketSize);
@@ -1631,6 +1782,63 @@ void loop() {
                      + String(timeManager.getCurrentTimeInSeconds(timeManager.now())) + "#" + String(pdDeviceName) + "#"
                      + String(pdDeviceShortName) + "#" + String(pdSerial));
       Serial.flush();
+    } else if (command.startsWith("ScanI2C")) {
+      // ScanI2C - probe every 7-bit address and list what answers, with the part Paula expects there
+      // (2026-11-11: the OLED stayed dark; this tells a missing/unpowered screen from a firmware problem).
+      // One line per device "I2C 0x3C OLED (SSD1306)", then "I2C found=<n>" and Ok-ScanI2C.
+      int found = 0;
+      for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() != 0) continue;
+        found++;
+        const char *what = "unknown";
+        switch (addr) {
+          case 0x3C: case 0x3D: what = "OLED (SSD1306)"; break;
+          case 0x44: what = "SHT3x temperature/humidity"; break;
+          case 0x48: case 0x49: case 0x4A: case 0x4B: what = "ADS1115 ADC"; break;
+          case 0x4F: what = "INA228 voltage monitor"; break;
+          case 0x51: what = "PCF8563 RTC"; break;
+        }
+        Serial.printf("I2C 0x%02X %s\n", addr, what);
+      }
+      Serial.printf("I2C found=%d%s\n", found, found == 0 ? " (nothing answered - check SDA/SCL and the 3.3V rail)" : "");
+      Wire.beginTransmission(0x3C);
+      bool oled = Wire.endTransmission() == 0;
+      Wire.beginTransmission(0x3D);
+      oled = oled || Wire.endTransmission() == 0;
+      if (!oled) Serial.println("I2C OLED not found at 0x3C or 0x3D - the screen is unpowered, unplugged or dead");
+      Serial.println("Ok-ScanI2C");
+      Serial.flush();
+    } else if (command.startsWith("Help") || command.startsWith("ListCommands")) {
+      // Help / ListCommands - the serial commands, one per line (2026-11-11)
+      static const char *const helpLines[] = {
+        "GetFirmware                 version and build time",
+        "GetSerialNumber             12-hex efuse MAC",
+        "GetProductDefinition        factory product definition",
+        "SetProductDefinition#name#power#battery#pcbs#firmware",
+        "GetTime / SetTime#...       RTC",
+        "Help / ListCommands         this list",
+        "ScanI2C                     list devices on the I2C bus (OLED, RTC, ADS1115, SHT3x, INA228)",
+        "debug#1 / debug#0           debug output on/off",
+        "Ping                        alive check (Ok-Ping)",
+        "Ping#<dBm>                  LoRa signal-survey ping, 2..17 dBm",
+        "LoraSniffer#1 / #0          print every LoRa packet heard",
+        "GetNearbyDevices            devices heard over LoRa",
+        "GetNearbyPacket#<serial>    last packet from a device + layout check",
+        "Relay#1 / Relay#0 / Relay   relay mode on/off/status",
+        "GetNoise                    channel noise level here",
+        "GetSensorData / AsyncData / GetLifeCycleData / GetWPSSensorData",
+        "GetIpAddress / IPAddr / SSID / RestartWifi / DeviceWifi",
+        "GetCommandCode / VerifyUserCode / GetSecret / SetSecret",
+        "SetStatusText / GetSwitchState / SetTestMode",
+        "GetUltrasonicReading / ReadClipsal / ReadClipsal2US / StopClipsal / ReadVoltageMonitor",
+        "TestI2CTemperatureSensor / TestTankPressureSensor1 / TestTankPressureSensor2",
+        "CalibrateFlowSensor1Start / CalibrateFlowSensor1Stop#<ml> (and 2)",
+        "PulseStart / PulseFinished / SetFieldId",
+      };
+      for (const char *line : helpLines) Serial.println(line);
+      Serial.println("Ok-Help");
+      Serial.flush();
     } else if (command.startsWith("GetFirmware")) {
       Serial.println("Version " + String(firmwareVersion) + " " FIRMWARE_BUILD_TIME);
       Serial.println(F("Ok-GetFirmware"));
@@ -1796,6 +2004,24 @@ void loop() {
     } else if (command.startsWith("GetNearbyDevices")) {
       printNearbyDevices();
       Serial.println("Ok-GetNearbyDevices");
+      Serial.flush();
+    } else if (command.startsWith("Relay")) {
+      // Relay#1 / Relay#0 - see the relay section; plain "Relay" just reports
+      String arg = generalFunctions.getValue(command, '#', 1);
+      if (arg.length()) {
+        relayOn = arg.toInt() > 0;
+        if (!relayOn) for (int i = 0; i < RELAY_QUEUE; i++) relayQueue[i].len = 0;
+      }
+      Serial.print("RELAY ");
+      printRelayJson();
+      Serial.println();
+      Serial.println("Ok-Relay");
+      Serial.flush();
+    } else if (command.startsWith("GetNoise")) {
+      Serial.print("NOISE ");
+      printNoiseJson();
+      Serial.println();
+      Serial.println("Ok-GetNoise");
       Serial.flush();
     } else if (command.startsWith("GetNearbyPacket")) {
       // GetNearbyPacket#<serial> - see printNearbyPacket()
