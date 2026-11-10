@@ -50,7 +50,9 @@ bool inPulse=false;
 // 6 = 2026-11-07: ReadVoltageMonitor - "Clipsal Voltage Monitor" test (INA228 at 0x4F + battery NTC on the
 //     pin-18 terminal, ANALOG jumper, ADS1115 AIN1).
 // 7 = 2026-11-07: ReadVoltageMonitor reads the NTC on AIN0 (pin-33 terminal, JP5) per the board's spec.
-const int firmwareVersion = 7;
+// 8 = 2026-11-10: Nearby Devices keeps each device's last packet as received (GetNearbyPacket - the
+//     page's "Data" button, which also checks the packet's layout) and lists Chinampa too.
+const int firmwareVersion = 8;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -187,6 +189,12 @@ volatile int loraPacketSize = 0;
 // works like Annabelle's (DeviceCommandQueue.h): resent after the device's VitalSigns until its
 // data shows the change. Everything runs in loop() - onReceive() only sets flags.
 #define NEARBY_MAX 8
+// The last packet of each nearby device, byte for byte as received (2026-11-10): the page's "Data"
+// button shows its values. Kept raw, not decoded here, because a device on old firmware sends an
+// older layout of the same size - PaulaDeployer (PacketLayouts) works out which layout fits.
+#define NEARBY_RAW_MAX 248
+#define NEARBY_TYPE_DSD      1   // DigitalStablesData
+#define NEARBY_TYPE_CHINAMPA 2   // ChinampaData
 struct NearbyDevice {
   char name[17];
   uint8_t serial[8];
@@ -195,7 +203,14 @@ struct NearbyDevice {
   float batteryVoltage;
   int rssi;
   uint32_t lastMs;      // 0 = slot unused
+  uint8_t type;         // NEARBY_TYPE_*
+  float snr;
+  uint16_t rawLen;
+  uint8_t raw[NEARBY_RAW_MAX];
 };
+uint8_t loraRxRaw[NEARBY_RAW_MAX];  // the packet being processed, before rssi/snr are written into it
+static_assert(sizeof(DigitalStablesData) <= NEARBY_RAW_MAX && sizeof(ChinampaData) <= NEARBY_RAW_MAX,
+              "NEARBY_RAW_MAX must hold every packet the Nearby list keeps");
 NearbyDevice nearby[NEARBY_MAX];
 DeviceCommandQueue deviceCommandQueue;
 // The LoRa "L" (LEDs 1, 6, 11, 12 - same glyph as Daffodil's drawLora) flashed for a WiFi command:
@@ -504,29 +519,79 @@ uint8_t xorChecksum(const void *data, size_t size, size_t checksumOffset) {
   return c;
 }
 
-void noteNearby(const DigitalStablesData &d) {
+// The device's slot: its own, else a free one, else the least recently heard.
+NearbyDevice &nearbySlot(const uint8_t *serial) {
   int slot = -1, oldest = 0;
   for (int i = 0; i < NEARBY_MAX; i++) {
-    if (nearby[i].lastMs && memcmp(nearby[i].serial, d.serialnumberarray, 8) == 0) { slot = i; break; }
+    if (nearby[i].lastMs && memcmp(nearby[i].serial, serial, 8) == 0) { slot = i; break; }
     if (!nearby[i].lastMs) { if (slot < 0) slot = i; continue; }
     if (nearby[i].lastMs < nearby[oldest].lastMs) oldest = i;
   }
   // a free slot found before the device's own one would duplicate it - look again
   for (int i = 0; i < NEARBY_MAX; i++) {
-    if (nearby[i].lastMs && memcmp(nearby[i].serial, d.serialnumberarray, 8) == 0) { slot = i; break; }
+    if (nearby[i].lastMs && memcmp(nearby[i].serial, serial, 8) == 0) { slot = i; break; }
   }
   if (slot < 0) slot = oldest;
-  NearbyDevice &n = nearby[slot];
+  return nearby[slot];
+}
+
+// What every packet type records: name, serial, how it was heard, and the packet itself (loraRxRaw).
+void noteNearbyCommon(NearbyDevice &n, const char *name, size_t nameLen, const uint8_t *serial, uint8_t type,
+                      int rssi, float snr, size_t rawLen) {
   memset(n.name, 0, sizeof(n.name));
-  for (int i = 0; i < 16 && i < (int)sizeof(d.devicename) && d.devicename[i]; i++) {
-    n.name[i] = (d.devicename[i] >= 32 && d.devicename[i] < 127) ? d.devicename[i] : '?';
+  for (size_t i = 0; i < 16 && i < nameLen && name[i]; i++) {
+    n.name[i] = (name[i] >= 32 && name[i] < 127) ? name[i] : '?';
   }
-  memcpy(n.serial, d.serialnumberarray, 8);
+  memcpy(n.serial, serial, 8);
+  n.type = type;
+  n.rssi = rssi;
+  n.snr = snr;
+  n.rawLen = rawLen > NEARBY_RAW_MAX ? NEARBY_RAW_MAX : rawLen;
+  memcpy(n.raw, loraRxRaw, n.rawLen);
+  n.lastMs = millis();
+}
+
+void noteNearby(const DigitalStablesData &d) {
+  NearbyDevice &n = nearbySlot(d.serialnumberarray);
   n.wifiStatus = d.wifiStatus;
   n.sleepTime = d.sleepTime;
   n.batteryVoltage = d.batteryVoltage;
-  n.rssi = (int)d.rssi;
-  n.lastMs = millis();
+  noteNearbyCommon(n, d.devicename, sizeof(d.devicename), d.serialnumberarray, NEARBY_TYPE_DSD, (int)d.rssi, d.snr,
+                   sizeof(DigitalStablesData));
+}
+
+// Chinampa (2026-11-10): listed so its Data can be seen - it is always awake, has no WiFi command and
+// no battery, so those fields stay 0. ChinampaData carries no checksum: a packet with no serial is
+// left out.
+void noteNearbyChinampa(const ChinampaData &d) {
+  bool hasSerial = false;
+  for (int i = 0; i < 8; i++) if (d.serialnumberarray[i] != 0 && d.serialnumberarray[i] != 0xFF) hasSerial = true;
+  if (!hasSerial) return;
+  NearbyDevice &n = nearbySlot(d.serialnumberarray);
+  n.wifiStatus = 0;
+  n.sleepTime = 0;
+  n.batteryVoltage = 0;
+  noteNearbyCommon(n, d.devicename, sizeof(d.devicename), d.serialnumberarray, NEARBY_TYPE_CHINAMPA, (int)d.rssi, d.snr,
+                   sizeof(ChinampaData));
+}
+
+// GetNearbyPacket#<serial, 16 hex digits> -> one line: PACKET {"serial","name","type","size","ageSec",
+// "rssi","snr","hex"} - the device's last packet as received. PaulaDeployer decodes it.
+bool printNearbyPacket(const String &serialHex) {
+  uint8_t serial[8];
+  if (serialHex.length() != 16) return false;
+  for (int b = 0; b < 8; b++) serial[b] = (uint8_t)strtoul(serialHex.substring(b * 2, b * 2 + 2).c_str(), nullptr, 16);
+  for (int i = 0; i < NEARBY_MAX; i++) {
+    const NearbyDevice &n = nearby[i];
+    if (!n.lastMs || memcmp(n.serial, serial, 8) != 0) continue;
+    Serial.printf("PACKET {\"serial\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"size\":%u,\"ageSec\":%lu,\"rssi\":%d,\"snr\":%.2f,\"hex\":\"",
+                  serialHex.c_str(), n.name, n.type == NEARBY_TYPE_CHINAMPA ? "ChinampaData" : "DigitalStablesData", n.rawLen,
+                  (unsigned long)((millis() - n.lastMs) / 1000), n.rssi, n.snr);
+    for (int k = 0; k < n.rawLen; k++) Serial.printf("%02X", n.raw[k]);
+    Serial.println("\"}");
+    return true;
+  }
+  return false;
 }
 
 void flashLoraL(CRGB color) {
@@ -616,8 +681,9 @@ void printNearbyDevices() {
     for (int b = 0; b < 8; b++) snprintf(sn + b * 2, 3, "%02X", n.serial[b]);
     if (!first) Serial.print(",");
     first = false;
-    Serial.printf("{\"name\":\"%s\",\"serial\":\"%s\",\"wifi\":%u,\"sleep\":%ld,\"battery\":%.2f,\"rssi\":%d,\"ageSec\":%lu",
-                  n.name, sn, n.wifiStatus, n.sleepTime, n.batteryVoltage, n.rssi, (unsigned long)((now - n.lastMs) / 1000));
+    Serial.printf("{\"name\":\"%s\",\"serial\":\"%s\",\"wifi\":%u,\"sleep\":%ld,\"battery\":%.2f,\"rssi\":%d,\"ageSec\":%lu,\"type\":\"%s\"",
+                  n.name, sn, n.wifiStatus, n.sleepTime, n.batteryVoltage, n.rssi, (unsigned long)((now - n.lastMs) / 1000),
+                  n.type == NEARBY_TYPE_CHINAMPA ? "ChinampaData" : "DigitalStablesData");
     DeviceCommandQueue::Slot c = deviceCommandQueue.status(n.serial);
     if (c.state != DEVICE_COMMAND_STATE_NONE) {
       Serial.printf(",\"cmd\":{\"on\":%s,\"state\":%u,\"sends\":%u,\"ageSec\":%lu}", c.command == DEVICE_COMMAND_WIFI_ON ? "true" : "false",
@@ -663,9 +729,11 @@ void processLora(int packetSize) {
   } else if (packetSize == sizeof(ChinampaData)) {
     memset(&chinampaData, 0, sizeof(ChinampaData));
     LoRa.readBytes((uint8_t*)&chinampaData, sizeof(ChinampaData));
+    memcpy(loraRxRaw, &chinampaData, sizeof(ChinampaData));  // as received, for the Data button
 
     chinampaData.rssi = LoRa.packetRssi();
     chinampaData.snr = LoRa.packetSnr();
+    noteNearbyChinampa(chinampaData);
     if (loraSniffer) printSniff("ChinampaData", packetSize, chinampaData.rssi, chinampaData.snr, chinampaData.devicename, sizeof(chinampaData.devicename), chinampaData.serialnumberarray, -1, chinampaData.latitude, chinampaData.longitude);
     //if(debug)
     if (debug) Serial.print("received chinampaData from ");
@@ -678,6 +746,7 @@ void processLora(int packetSize) {
   } else if (packetSize == sizeof(DigitalStablesData)) {
     memset(&digitalStablesData, 0, sizeof(DigitalStablesData));
     LoRa.readBytes((uint8_t*)&digitalStablesData, sizeof(DigitalStablesData));
+    memcpy(loraRxRaw, &digitalStablesData, sizeof(DigitalStablesData));  // as received, for the Data button
     // Checked on the bytes as received, before rssi/snr (inside the checksummed range) are overwritten.
     bool dsChecksumOk = xorChecksum(&digitalStablesData, sizeof(DigitalStablesData), offsetof(DigitalStablesData, checksum))
                         == digitalStablesData.checksum;
@@ -1727,6 +1796,14 @@ void loop() {
     } else if (command.startsWith("GetNearbyDevices")) {
       printNearbyDevices();
       Serial.println("Ok-GetNearbyDevices");
+      Serial.flush();
+    } else if (command.startsWith("GetNearbyPacket")) {
+      // GetNearbyPacket#<serial> - see printNearbyPacket()
+      String serialHex = generalFunctions.getValue(command, '#', 1);
+      serialHex.trim();
+      serialHex.toUpperCase();
+      if (printNearbyPacket(serialHex)) Serial.println("Ok-GetNearbyPacket");
+      else Serial.println("Failure-GetNearbyPacket-not heard");
       Serial.flush();
     } else if (command.startsWith("DeviceWifi")) {
       // DeviceWifi#<serial, 16 hex digits>#on|off - PaulaDeployer's Nearby devices button
