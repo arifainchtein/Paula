@@ -58,8 +58,10 @@ bool inPulse=false;
 //     Also (2026-11-11): ScanI2C (lists what answers on the I2C bus - to see whether the OLED is there)
 //     and Help / ListCommands (lists the serial commands). OLED_SMALL: a 0.91" 128x32 screen that
 //     shows the name of each device heard, big (showHeard). Relayed DigitalStablesData/ChinampaData
-//     carry sentbyarray "Paula".
-const int firmwareVersion = 9;
+//     carry sentbyarray "Paula". LEDs show rotating status glyphs (L F R, green/red) like Daffodil.
+// 10 = 2026-11-11: the LEDs show rotating status glyphs like Daffodil - L (LoRa), F (forecast), R (relay),
+//      each green = good / on, red = bad / off; a packet heard = a short rainbow light show.
+const int firmwareVersion = 10;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -797,6 +799,33 @@ void printRelayJson() {
   Serial.printf("{\"on\":%s,\"heard\":%lu,\"sent\":%lu,\"dup\":%lu,\"dropped\":%lu,\"queued\":%d}", relayOn ? "true" : "false",
                 (unsigned long)relayHeard, (unsigned long)relaySent, (unsigned long)relayDup, (unsigned long)relayDropped, queued);
 }
+
+// Glyphs on the 15 LEDs (2026-11-11): a 5-wide, 3-high grid, LED = row * 5 + column (the "L" below
+// is 1, 6, 11 down and 12 across). Each row is a 5-bit mask, bit 4 = column 0 (left). Clears the
+// rest of the grid.
+void drawGlyph(const uint8_t rows[3], CRGB color) {
+  for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 5; c++)
+      if (rows[r] & (0x10 >> c)) leds[r * 5 + c] = color;
+}
+
+// Status glyphs, shown one after another like Daffodil's display (showStatusGlyphs, from loop()):
+// GLYPH_STEP_MS each with a short dark gap between, green = good / on, red = bad / off.
+//   L  LoRa      green: the radio started. Red: LoRa.begin failed.
+//   F  Forecast  green: Annabelle's weather forecast heard within WEATHER_STALE_INTERVAL. Red: stale.
+//   R  Relay     green: relay mode on (Relay#1). Red: off - it is off after every boot.
+// A packet heard: a short light show - a rainbow sweeping across the grid for PACKET_SHOW_MS - then
+// the glyphs carry on. (WiFi isn't shown: Paula talks to the Pi over USB, so it is always off.)
+// (Before 2026-11-11: LED 0 WiFi, 1 LoRa, 2-3 forecast, 4-5 a packet, and a rainbow on 8-14.)
+const uint8_t GLYPH_L[3] = { 0x08, 0x08, 0x0E };  // .X... / .X... / .XXX.
+const uint8_t GLYPH_F[3] = { 0x0E, 0x0C, 0x08 };  // .XXX. / .XX.. / .X...
+const uint8_t GLYPH_R[3] = { 0x0C, 0x0C, 0x0A };  // .XX.. / .XX.. / .X.X.
+#define GLYPH_STEP_MS 1500
+#define GLYPH_GAP_MS 200
+#define PACKET_SHOW_MS 600
+unsigned long packetShowUntil = 0;
+int lastGlyphKey = -1;  // what is on the LEDs now; -1 = redraw
 
 void flashLoraL(CRGB color) {
   for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
@@ -1597,6 +1626,39 @@ unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, vola
   return captured;
 }
 
+// One status glyph at a time - L, F, R (see GLYPH_L above). Redraws only when what should show
+// changes; while a packet's light show runs, every loop draws its next frame instead.
+void showStatusGlyphs() {
+  unsigned long now = millis();
+  if ((long)(packetShowUntil - now) > 0) {
+    // rainbow sweep: each column a hue, the whole rainbow sliding right as the show runs
+    uint8_t shift = (uint8_t)((PACKET_SHOW_MS - (packetShowUntil - now)) * 255UL / PACKET_SHOW_MS);
+    for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 5; c++) leds[r * 5 + c] = CHSV((uint8_t)(c * 40 + r * 15 - shift), 255, 255);
+    FastLED.show();
+    lastGlyphKey = -1;  // redraw the glyph when the show ends
+    return;
+  }
+  int step = (now / GLYPH_STEP_MS) % 3;
+  bool gap = (now % GLYPH_STEP_MS) < GLYPH_GAP_MS;
+  bool good = false;
+  const uint8_t *glyph = GLYPH_L;
+  switch (step) {
+    case 0: glyph = GLYPH_L; good = loraActive; break;
+    case 1: glyph = GLYPH_F; good = lastWeatherForecastSeconds <= WEATHER_STALE_INTERVAL; break;
+    case 2: glyph = GLYPH_R; good = relayOn; break;
+  }
+  int key = (gap ? 3 : step) | (good ? 4 : 0);
+  if (key == lastGlyphKey) return;
+  lastGlyphKey = key;
+  if (gap) {
+    for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
+  } else {
+    drawGlyph(glyph, good ? CRGB(0, 255, 0) : CRGB(255, 0, 0));
+  }
+  FastLED.show();
+}
+
 void loop() {
   // put your main code here, to run repeatedly:
 
@@ -1610,8 +1672,6 @@ void loop() {
     if (loraActive && !loraReceived) noteNoiseSample(LoRa.rssi());  // the channel's noise here
     lastLoraReceptionSeconds++;
     lastWeatherForecastSeconds++;
-    leds[4] = CRGB(0, 0, 0);
-    leds[5] = CRGB(0, 0, 0);
     // The physical left/right toggle switch (previously read here on pins 32/33) no longer
     // exists on this board - the Daffodil shield replacing the Paula shield wires pin 33 to
     // Flow Sensor 2 instead. switchPositionLeft keeps its fixed default (see declaration) and
@@ -1637,15 +1697,11 @@ void loop() {
     // the command "L" is showing - see flashLoraL()
   } else {
     if (commandFlashUntil) {
-      leds[6] = leds[11] = leds[12] = CRGB(0, 0, 0);  // rest of the L; LED 1 is set just below
       FastLED.setBrightness(NORMAL_BRIGHTNESS);
       commandFlashUntil = 0;
+      lastGlyphKey = -1;  // the command's L is over - draw the status glyph again
     }
-    leds[0] = (currentIpAddress != "No IP") ? CRGB(0, 255, 0) : CRGB(32, 0, 0);
-    leds[1] = loraActive ? CRGB(0, 255, 0) : CRGB(255, 0, 0);
-    leds[2] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
-    leds[3] = (lastWeatherForecastSeconds > WEATHER_STALE_INTERVAL) ? CRGB(255, 0, 0) : CRGB(0, 255, 0);
-    FastLED.show();
+    showStatusGlyphs();
   }
   serviceRelay();
   if (loraReceived) {
@@ -1654,15 +1710,13 @@ void loop() {
     if (debug) Serial.println("");
     processLora(loraPacketSize);
     loraReceived = false;
-    leds[4] = leds[5] = CRGB(0, 255, 0);
-    FastLED.show();
+    packetShowUntil = millis() + PACKET_SHOW_MS;  // the packet light show - see showStatusGlyphs
     bool show = false;
     currentPalette = RainbowStripeColors_p;
     currentBlending = NOBLEND;
 
     //  performLedShow(250);
-    ledShowDuration = 250;  // Set desired duration in milliseconds
-    runLedShow = true;      // Set flag to trigger the show
+    // (the rainbow on LEDs 8-14 after each packet is off since 2026-11-11 - it drew over the glyphs)
 
 
     if (loraPacketSize == sizeof(LangleyData)) {
@@ -1805,8 +1859,6 @@ void loop() {
       //  delay(500);
     } else if (loraPacketSize == sizeof(WeatherForecastUpdate)) {
       if (weatherForecastNewData) {
-        leds[4] = leds[5] = CRGB(0, 100, 255);
-        FastLED.show();
         if (oledDetailed) showWeatherForecast();
         weatherForecastNewData = false;
       }
