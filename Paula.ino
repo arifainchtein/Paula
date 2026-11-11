@@ -814,13 +814,13 @@ void drawGlyph(const uint8_t rows[3], CRGB color) {
 // GLYPH_STEP_MS each with a short dark gap between, green = good / on, red = bad / off.
 //   L  LoRa      green: the radio started. Red: LoRa.begin failed.
 //   F  Forecast  green: Annabelle's weather forecast heard within WEATHER_STALE_INTERVAL. Red: stale.
-//   R  Relay     green: relay mode on (Relay#1). Red: off - it is off after every boot.
+//   r  Relay     green: relay mode on (Relay#1). Red: off - it is off after every boot.
 // A packet heard: a short light show - a rainbow sweeping across the grid for PACKET_SHOW_MS - then
 // the glyphs carry on. (WiFi isn't shown: Paula talks to the Pi over USB, so it is always off.)
 // (Before 2026-11-11: LED 0 WiFi, 1 LoRa, 2-3 forecast, 4-5 a packet, and a rainbow on 8-14.)
-const uint8_t GLYPH_L[3] = { 0x08, 0x08, 0x0E };  // .X... / .X... / .XXX.
+const uint8_t GLYPH_L[3] = { 0x08, 0x08, 0x0C };  // .X... / .X... / .XX..
 const uint8_t GLYPH_F[3] = { 0x0E, 0x0C, 0x08 };  // .XXX. / .XX.. / .X...
-const uint8_t GLYPH_R[3] = { 0x0C, 0x0C, 0x0A };  // .XX.. / .XX.. / .X.X.
+const uint8_t GLYPH_R[3] = { 0x00, 0x0C, 0x08 };  // ..... / .XX.. / .X...  (a small r, bottom two rows)
 #define GLYPH_STEP_MS 1500
 #define GLYPH_GAP_MS 200
 #define PACKET_SHOW_MS 600
