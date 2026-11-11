@@ -60,7 +60,8 @@ bool inPulse=false;
 //     shows the name of each device heard, big (showHeard). Relayed DigitalStablesData/ChinampaData
 //     carry sentbyarray "Paula". LEDs show rotating status glyphs (L F R, green/red) like Daffodil.
 // 10 = 2026-11-11: the LEDs show rotating status glyphs like Daffodil - L (LoRa), F (forecast), R (relay),
-//      each green = good / on, red = bad / off; a packet heard = a short rainbow light show.
+//      each green = good / on, red = bad / off; a packet heard = a short rainbow light show. Relay
+//      ticker: the OLED's bottom line shows "> <name> relayed" for 5 s after each packet relayed.
 const int firmwareVersion = 10;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -245,7 +246,13 @@ static_assert(sizeof(DigitalStablesData) <= NEARBY_RAW_MAX && sizeof(ChinampaDat
 #define RELAY_SEEN 32
 #define RELAY_SEEN_MS (10UL * 60UL * 1000UL)
 #define RELAY_BUSY_DB 12
-struct RelaySlot { uint16_t len; uint8_t waits; uint32_t dueMs; uint8_t bytes[NEARBY_RAW_MAX]; };
+struct RelaySlot { uint16_t len; uint8_t waits; uint32_t dueMs; char name[17]; uint8_t bytes[NEARBY_RAW_MAX]; };
+// The OLED's relay ticker (2026-11-11): the last packet relayed, on the bottom line for RELAY_TICKER_MS.
+#define RELAY_TICKER_MS 5000
+int relayJustQueued = -1;     // slot noteRelayCandidate just filled - named in loop() once processLora is done
+char relayTickerName[17] = "";
+uint32_t relayTickerAt = 0;   // millis() of the last relay sent, 0 = none
+bool relayTickerShowing = false;
 bool relayOn = false;
 RelaySlot relayQueue[RELAY_QUEUE];  // len 0 = free
 uint32_t relaySeenHash[RELAY_SEEN];
@@ -749,6 +756,8 @@ void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd) {
     relayQueue[i].len = len;
     relayQueue[i].waits = 0;
     relayQueue[i].dueMs = now + random(150, 650);
+    relayQueue[i].name[0] = 0;
+    relayJustQueued = i;
     memcpy(relayQueue[i].bytes, p, len);
     // Mark the copy as relayed (2026-11-11): sentbyarray = "Paula", the field Chinampa already fills
     // ("Chinamp") when it resends a Daffodil - Annabelle shows it, so a relayed packet can be told
@@ -787,7 +796,14 @@ void serviceRelay() {
     LoRa.write(r.bytes, r.len);
     bool ok = LoRa.endPacket();
     LoRa_rxMode();
-    if (ok) relaySent++;
+    if (ok) {
+      relaySent++;
+      strncpy(relayTickerName, r.name[0] ? r.name : "packet", sizeof(relayTickerName) - 1);
+      relayTickerName[sizeof(relayTickerName) - 1] = 0;
+      relayTickerAt = millis();
+      if (!relayTickerAt) relayTickerAt = 1;
+      lastHeardNew = true;  // redraw the OLED with the ticker line
+    }
     if (debug) Serial.printf("relayed %u bytes: %s\n", r.len, ok ? "ok" : "failed");
     r.len = 0;
   }
@@ -1365,8 +1381,14 @@ void showHeard() {
   display.setCursor((SCREEN_WIDTH - (int)w) / 2, y);
   display.print(lastHeardName);
   char line[22];
-  snprintf(line, sizeof(line), "%ddBm %02d:%02d:%02d", lastHeardRssi, currentTimerRecord.hour,
-           currentTimerRecord.minute, currentTimerRecord.second);
+  relayTickerShowing = relayOn && relayTickerAt && millis() - relayTickerAt < RELAY_TICKER_MS;
+  if (relayTickerShowing) {
+    // relay ticker: the last packet Paula resent, e.g. "> Chinampa relayed"
+    snprintf(line, sizeof(line), "> %.10s relayed", relayTickerName);
+  } else {
+    snprintf(line, sizeof(line), "%ddBm %02d:%02d:%02d", lastHeardRssi, currentTimerRecord.hour,
+             currentTimerRecord.minute, currentTimerRecord.second);
+  }
   centerText(line, 24);
   display.display();
 }
@@ -1681,7 +1703,9 @@ void loop() {
 
 
   if (!oledDetailed) {
-    // OLED_SMALL: only the last device heard, redrawn when a new packet came in
+    // OLED_SMALL: only the last device heard, redrawn when a new packet came in - and when the relay
+    // ticker line runs out
+    if (relayTickerShowing && millis() - relayTickerAt >= RELAY_TICKER_MS) lastHeardNew = true;
     if (lastHeardNew) {
       lastHeardNew = false;
       showHeard();
@@ -1710,6 +1734,11 @@ void loop() {
     if (debug) Serial.println("");
     processLora(loraPacketSize);
     loraReceived = false;
+    if (relayJustQueued >= 0) {  // name the packet just queued for relaying - processLora's noteHeard knows it
+      strncpy(relayQueue[relayJustQueued].name, lastHeardName, sizeof(relayQueue[relayJustQueued].name) - 1);
+      relayQueue[relayJustQueued].name[sizeof(relayQueue[relayJustQueued].name) - 1] = 0;
+      relayJustQueued = -1;
+    }
     packetShowUntil = millis() + PACKET_SHOW_MS;  // the packet light show - see showStatusGlyphs
     bool show = false;
     currentPalette = RainbowStripeColors_p;
