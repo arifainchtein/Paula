@@ -62,7 +62,9 @@ bool inPulse=false;
 // 10 = 2026-11-11: the LEDs show rotating status glyphs like Daffodil - L (LoRa), F (forecast), R (relay),
 //      each green = good / on, red = bad / off; a packet heard = a short rainbow light show. Relay
 //      ticker: the OLED's bottom line shows "> <name> relayed" for 5 s after each packet relayed.
-const int firmwareVersion = 10;
+// 11 = 2026-11-11: Relay / GetNearbyDevices report the last packet relayed ("last", "lastAgeSec") -
+//      PaulaDeployer's relay ticker line on Nearby Devices.
+const int firmwareVersion = 11;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -812,8 +814,17 @@ void serviceRelay() {
 void printRelayJson() {
   int queued = 0;
   for (int i = 0; i < RELAY_QUEUE; i++) if (relayQueue[i].len) queued++;
-  Serial.printf("{\"on\":%s,\"heard\":%lu,\"sent\":%lu,\"dup\":%lu,\"dropped\":%lu,\"queued\":%d}", relayOn ? "true" : "false",
+  Serial.printf("{\"on\":%s,\"heard\":%lu,\"sent\":%lu,\"dup\":%lu,\"dropped\":%lu,\"queued\":%d", relayOn ? "true" : "false",
                 (unsigned long)relayHeard, (unsigned long)relaySent, (unsigned long)relayDup, (unsigned long)relayDropped, queued);
+  // the last packet relayed (2026-11-11) - PaulaDeployer's relay ticker line
+  if (relayTickerAt) {
+    char safe[17];
+    int n = 0;
+    for (const char *c = relayTickerName; *c && n < 16; c++) if (*c >= 32 && *c < 127 && *c != '"' && *c != '\\') safe[n++] = *c;
+    safe[n] = 0;
+    Serial.printf(",\"last\":\"%s\",\"lastAgeSec\":%lu", safe, (unsigned long)((millis() - relayTickerAt) / 1000));
+  }
+  Serial.print("}");
 }
 
 // Glyphs on the 15 LEDs (2026-11-11): a 5-wide, 3-high grid, LED = row * 5 + column (the "L" below
