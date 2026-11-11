@@ -66,7 +66,8 @@ bool inPulse=false;
 //      PaulaDeployer's relay ticker line on Nearby Devices.
 // 12 = 2026-11-11: relays LangleyData too (it has a sentbyarray now, 164 bytes). Strong-signal rule: a
 //      packet heard at -80 dBm or stronger isn't relayed (Relay#1#<dBm> changes it, 0 = relay
-//      everything) - the ticker says "<name> strong -58".
+//      everything) - the ticker says "<name> strong -58". LEDs capped at 100 mA (FastLED power limit) and
+//      the packet rainbow on the middle row only - V50 sagged to 3.96 V and the OLED blanked.
 const int firmwareVersion = 12;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -297,6 +298,7 @@ DeviceCommandQueue deviceCommandQueue;
 #define COMMAND_FLASH_MS 3000
 #define COMMAND_FLASH_BRIGHTNESS 80   // brighter than normal (50) so the L stands out (120 was too bright)
 #define NORMAL_BRIGHTNESS 50
+#define LED_MAX_MILLIAMPS 100  // FastLED's power cap - see setup()
 unsigned long commandFlashUntil = 0;
 
 // LoRa Sniffer (2026-10-24): after LoraSniffer#1 (LoraSniffer#0 stops it), one line per packet
@@ -880,7 +882,7 @@ void drawGlyph(const uint8_t rows[3], CRGB color) {
 //   L  LoRa      green: the radio started. Red: LoRa.begin failed.
 //   F  Forecast  green: Annabelle's weather forecast heard within WEATHER_STALE_INTERVAL. Red: stale.
 //   r  Relay     green: relay mode on (Relay#1). Red: off - it is off after every boot.
-// A packet heard: a short light show - a rainbow sweeping across the grid for PACKET_SHOW_MS - then
+// A packet heard: a short light show - a rainbow sweeping along the middle row for PACKET_SHOW_MS - then
 // the glyphs carry on. (WiFi isn't shown: Paula talks to the Pi over USB, so it is always off.)
 // (Before 2026-11-11: LED 0 WiFi, 1 LoRa, 2-3 forecast, 4-5 a packet, and a rainbow on 8-14.)
 const uint8_t GLYPH_L[3] = { 0x08, 0x08, 0x0C };  // .X... / .X... / .XX..
@@ -1272,6 +1274,10 @@ void setup() {
   timeManager.printTimeToSerial(currentTimerRecord);
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(NORMAL_BRIGHTNESS);
+  // LED current cap (2026-11-11): V50 measured 3.96 V on Paula's screw terminals and the OLED went blank
+  // (still answering on I2C - a brown-out reset of its controller). FastLED dims every frame that would
+  // draw more than LED_MAX_MILLIAMPS, so the LEDs can't drag the rail down.
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, LED_MAX_MILLIAMPS);
 
   for (int i = 0; i < NUM_LEDS; i++) {
     leds[i] = CRGB(255, 255, 0);
@@ -1706,10 +1712,11 @@ unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, vola
 void showStatusGlyphs() {
   unsigned long now = millis();
   if ((long)(packetShowUntil - now) > 0) {
-    // rainbow sweep: each column a hue, the whole rainbow sliding right as the show runs
+    // rainbow sweep on the middle row only (2026-11-11: all 15 LEDs pulled V50 down - see LED_MAX_MILLIAMPS),
+    // each LED a hue, the rainbow sliding right as the show runs
     uint8_t shift = (uint8_t)((PACKET_SHOW_MS - (packetShowUntil - now)) * 255UL / PACKET_SHOW_MS);
-    for (int r = 0; r < 3; r++)
-      for (int c = 0; c < 5; c++) leds[r * 5 + c] = CHSV((uint8_t)(c * 40 + r * 15 - shift), 255, 255);
+    for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
+    for (int c = 0; c < 5; c++) leds[5 + c] = CHSV((uint8_t)(c * 40 - shift), 255, 255);
     FastLED.show();
     lastGlyphKey = -1;  // redraw the glyph when the show ends
     return;
