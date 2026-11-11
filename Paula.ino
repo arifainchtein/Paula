@@ -68,7 +68,9 @@ bool inPulse=false;
 //      packet heard at -80 dBm or stronger isn't relayed (Relay#1#<dBm> changes it, 0 = relay
 //      everything) - the ticker says "<name> strong -58". LEDs capped at 100 mA (FastLED power limit) and
 //      the packet rainbow on the middle row only - V50 sagged to 3.96 V and the OLED blanked.
-const int firmwareVersion = 12;
+// 13 = 2026-11-11: Annabelle's forecast accepted - its code is checked against the time Annabelle stamped
+//      on it (annabelleTime), as Langley/Daffodil do; checking against Paula's clock rejected every one.
+const int firmwareVersion = 13;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -1119,7 +1121,11 @@ void processLora(int packetSize) {
   } else if (packetSize == sizeof(WeatherForecastUpdate)) {
     WeatherForecastUpdate wfu;
     LoRa.readBytes((uint8_t*)&wfu, sizeof(WeatherForecastUpdate));
-    bool validCode = secretManager.checkCode(wfu.totpcode);
+    // The code is for annabelleTime, the time Annabelle stamped on it - checked against that, as
+    // Langley and Daffodil do (acceptAnnabelleTime), not against Paula's own clock: checkCode() used
+    // Paula's code time, which never matched, so every forecast was rejected (2026-11-11 sniffer:
+    // 14:25-14:55, all ok=false, with the right secret).
+    bool validCode = wfu.annabelleTime != 0 && secretManager.generateCodeAt(wfu.annabelleTime) == wfu.totpcode;
     noteHeard("Weather", 8, NULL, "Forecast");
     if (loraSniffer) printSniff("WeatherForecastUpdate", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, NULL, validCode, NAN, NAN);
     if (validCode) {
