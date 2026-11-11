@@ -64,7 +64,10 @@ bool inPulse=false;
 //      ticker: the OLED's bottom line shows "> <name> relayed" for 5 s after each packet relayed.
 // 11 = 2026-11-11: Relay / GetNearbyDevices report the last packet relayed ("last", "lastAgeSec") -
 //      PaulaDeployer's relay ticker line on Nearby Devices.
-const int firmwareVersion = 11;
+// 12 = 2026-11-11: relays LangleyData too (it has a sentbyarray now, 164 bytes). Strong-signal rule: a
+//      packet heard at -80 dBm or stronger isn't relayed (Relay#1#<dBm> changes it, 0 = relay
+//      everything) - the ticker says "<name> strong -58".
+const int firmwareVersion = 12;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -253,8 +256,22 @@ struct RelaySlot { uint16_t len; uint8_t waits; uint32_t dueMs; char name[17]; u
 #define RELAY_TICKER_MS 5000
 int relayJustQueued = -1;     // slot noteRelayCandidate just filled - named in loop() once processLora is done
 char relayTickerName[17] = "";
-uint32_t relayTickerAt = 0;   // millis() of the last relay sent, 0 = none
+uint32_t relayTickerAt = 0;   // millis() of the last ticker event, 0 = none
 bool relayTickerShowing = false;
+// What the ticker says (2026-11-11): RELAY_TICK_SENT = resent; RELAY_TICK_STRONG = not resent, heard
+// so strongly here that the device doesn't need Paula (relayTickerRssi says how strong).
+#define RELAY_TICK_SENT 1
+#define RELAY_TICK_STRONG 2
+uint8_t relayTickerAction = 0;
+int relayTickerRssi = 0;
+// Strong-signal rule (2026-11-11): a packet heard at relayStrongDbm or stronger is not relayed - a
+// relay is for devices that are hard to hear, and Paula next to a device would otherwise resend all
+// of it. Relay#1#<dBm> sets it (Relay#1#0 = relay everything); Relay#1 alone keeps the current one.
+#define RELAY_STRONG_DBM_DEFAULT -80
+int relayStrongDbm = RELAY_STRONG_DBM_DEFAULT;
+uint32_t relayStrong = 0;     // packets not relayed for being strong
+int relayPendingStrongRssi = 0;  // a strong skip in this processLora - named in loop() like relayJustQueued
+bool relayPendingStrong = false;
 bool relayOn = false;
 RelaySlot relayQueue[RELAY_QUEUE];  // len 0 = free
 uint32_t relaySeenHash[RELAY_SEEN];
@@ -723,7 +740,12 @@ void printNoiseJson() {
 // ---- relay ----
 uint32_t relayHash(const uint8_t *p, size_t len, bool isDsd) {
   uint32_t h = 2166136261u;
+  bool isLangley = len == sizeof(LangleyData);
   for (size_t i = 0; i < len; i++) {
+    // LangleyData the same way: sentby, checksum and the receiver's rssi/snr change between copies
+    if (isLangley && (i == offsetof(LangleyData, checksum) ||
+                      (i >= offsetof(LangleyData, sentbyarray) && i < offsetof(LangleyData, sentbyarray) + 8) ||
+                      (i >= offsetof(LangleyData, rssi) && i < offsetof(LangleyData, snr) + sizeof(float)))) continue;
     // sentbyarray and so the checksum change at every hop (Chinampa "Chinamp", Paula "Paula") - both
     // left out, or Paula would take Chinampa's resend of her own relay for a new packet (2026-11-11)
     if (isDsd && i == offsetof(DigitalStablesData, checksum)) continue;
@@ -736,16 +758,23 @@ uint32_t relayHash(const uint8_t *p, size_t len, bool isDsd) {
 }
 
 // A packet as received: queued for resending if relay mode is on and it hasn't been relayed already.
-void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd) {
+void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd, int rssi) {
   if (!relayOn || len > NEARBY_RAW_MAX) return;
   // Already relayed by someone (sentbyarray set - Chinampa's "Chinamp"): not sent again, same rule as
   // Chinampa's relay, so two relays can't bounce a packet between them (2026-11-11).
-  if (len == sizeof(DigitalStablesData) || len == sizeof(ChinampaData)) {
-    const uint8_t *sb = p + (len == sizeof(DigitalStablesData) ? offsetof(DigitalStablesData, sentbyarray)
-                                                                 : offsetof(ChinampaData, sentbyarray));
-    for (int i = 0; i < 8; i++) if (sb[i]) return;
+  if (len == sizeof(DigitalStablesData) || len == sizeof(ChinampaData) || len == sizeof(LangleyData)) {
+    size_t at = len == sizeof(DigitalStablesData) ? offsetof(DigitalStablesData, sentbyarray)
+              : len == sizeof(ChinampaData) ? offsetof(ChinampaData, sentbyarray) : offsetof(LangleyData, sentbyarray);
+    for (int i = 0; i < 8; i++) if (p[at + i]) return;
   }
   relayHeard++;
+  // Heard strongly here: the device doesn't need a relay (see relayStrongDbm). Shown on the ticker.
+  if (relayStrongDbm < 0 && rssi >= relayStrongDbm) {
+    relayStrong++;
+    relayPendingStrong = true;
+    relayPendingStrongRssi = rssi;
+    return;
+  }
   uint32_t h = relayHash(p, len, isDsd), now = millis();
   for (int i = 0; i < RELAY_SEEN; i++) {
     if (relaySeenMs[i] && relaySeenHash[i] == h && now - relaySeenMs[i] < RELAY_SEEN_MS) { relayDup++; return; }
@@ -771,6 +800,12 @@ void noteRelayCandidate(const uint8_t *p, size_t len, bool isDsd) {
       memset(d->sentbyarray, 0, sizeof(d->sentbyarray));
       memcpy(d->sentbyarray, "Paula", 5);
       d->checksum = xorChecksum(d, sizeof(DigitalStablesData), offsetof(DigitalStablesData, checksum));
+    } else if (len == sizeof(LangleyData)) {
+      // LangleyData has a sentbyarray since 2026-11-11; its checksum covers it, like DigitalStablesData's
+      LangleyData *l = (LangleyData *)relayQueue[i].bytes;
+      memset(l->sentbyarray, 0, sizeof(l->sentbyarray));
+      memcpy(l->sentbyarray, "Paula", 5);
+      l->checksum = xorChecksum(l, sizeof(LangleyData), offsetof(LangleyData, checksum));
     } else if (len == sizeof(ChinampaData)) {
       ChinampaData *c = (ChinampaData *)relayQueue[i].bytes;
       memset(c->sentbyarray, 0, sizeof(c->sentbyarray));
@@ -802,6 +837,7 @@ void serviceRelay() {
       relaySent++;
       strncpy(relayTickerName, r.name[0] ? r.name : "packet", sizeof(relayTickerName) - 1);
       relayTickerName[sizeof(relayTickerName) - 1] = 0;
+      relayTickerAction = RELAY_TICK_SENT;
       relayTickerAt = millis();
       if (!relayTickerAt) relayTickerAt = 1;
       lastHeardNew = true;  // redraw the OLED with the ticker line
@@ -822,9 +858,11 @@ void printRelayJson() {
     int n = 0;
     for (const char *c = relayTickerName; *c && n < 16; c++) if (*c >= 32 && *c < 127 && *c != '"' && *c != '\\') safe[n++] = *c;
     safe[n] = 0;
-    Serial.printf(",\"last\":\"%s\",\"lastAgeSec\":%lu", safe, (unsigned long)((millis() - relayTickerAt) / 1000));
+    Serial.printf(",\"last\":\"%s\",\"lastAgeSec\":%lu,\"lastAction\":\"%s\",\"lastRssi\":%d", safe,
+                  (unsigned long)((millis() - relayTickerAt) / 1000), relayTickerAction == RELAY_TICK_STRONG ? "strong" : "relayed",
+                  relayTickerRssi);
   }
-  Serial.print("}");
+  Serial.printf(",\"strong\":%lu,\"strongDbm\":%d}", (unsigned long)relayStrong, relayStrongDbm);
 }
 
 // Glyphs on the 15 LEDs (2026-11-11): a 5-wide, 3-high grid, LED = row * 5 + column (the "L" below
@@ -969,6 +1007,9 @@ void processLora(int packetSize) {
   if(debug)Serial.println("received " + String(packetSize));
   if (packetSize == sizeof(LangleyData)) {
     LoRa.readBytes((uint8_t*)&langleyData, sizeof(LangleyData));
+    // relayed too since 2026-11-11 (LangleyData has a sentbyarray) - checked on the bytes as received
+    if (xorChecksum(&langleyData, sizeof(LangleyData), offsetof(LangleyData, checksum)) == langleyData.checksum)
+      noteRelayCandidate((const uint8_t *)&langleyData, sizeof(LangleyData), false, LoRa.packetRssi());
 
     langleyData.rssi = LoRa.packetRssi();
     langleyData.snr = LoRa.packetSnr();
@@ -997,7 +1038,7 @@ void processLora(int packetSize) {
     LoRa.readBytes((uint8_t*)&chinampaData, sizeof(ChinampaData));
     memcpy(loraRxRaw, &chinampaData, sizeof(ChinampaData));  // as received, for the Data button
 
-    noteRelayCandidate(loraRxRaw, sizeof(ChinampaData), false);
+    noteRelayCandidate(loraRxRaw, sizeof(ChinampaData), false, LoRa.packetRssi());
     chinampaData.rssi = LoRa.packetRssi();
     chinampaData.snr = LoRa.packetSnr();
     noteNearbyChinampa(chinampaData);
@@ -1019,7 +1060,7 @@ void processLora(int packetSize) {
     bool dsChecksumOk = xorChecksum(&digitalStablesData, sizeof(DigitalStablesData), offsetof(DigitalStablesData, checksum))
                         == digitalStablesData.checksum;
     digitalStablesDataNewData = true;
-    if (dsChecksumOk) noteRelayCandidate(loraRxRaw, sizeof(DigitalStablesData), true);
+    if (dsChecksumOk) noteRelayCandidate(loraRxRaw, sizeof(DigitalStablesData), true, LoRa.packetRssi());
     digitalStablesData.rssi = LoRa.packetRssi();
     digitalStablesData.snr = LoRa.packetSnr();
     noteHeard(digitalStablesData.devicename, sizeof(digitalStablesData.devicename), NULL, dsChecksumOk ? "Data" : "Data bad");
@@ -1059,7 +1100,7 @@ void processLora(int packetSize) {
     bool vsOk = xorChecksum(&vs, sizeof(vs), offsetof(VitalSignsRecord, checksum)) == vs.checksum;
     if (vsOk) {
       deviceCommandQueue.noteVitalSigns(vs.serialnumberarray, millis());
-      noteRelayCandidate((const uint8_t *)&vs, sizeof(vs), false);
+      noteRelayCandidate((const uint8_t *)&vs, sizeof(vs), false, LoRa.packetRssi());
     }
     noteHeard(NULL, 0, vs.serialnumberarray, "Vitals");
     if (loraSniffer) printSniff("VitalSignsRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, vs.serialnumberarray, vsOk, NAN, NAN);
@@ -1107,7 +1148,7 @@ void processLora(int packetSize) {
     LinkHealthRecord lh;
     LoRa.readBytes((uint8_t*)&lh, sizeof(LinkHealthRecord));
     bool lhOk = linkHealthValid(lh);
-    if (lhOk) noteRelayCandidate((const uint8_t *)&lh, sizeof(lh), false);
+    if (lhOk) noteRelayCandidate((const uint8_t *)&lh, sizeof(lh), false, LoRa.packetRssi());
     noteHeard(NULL, 0, lh.serialnumberarray, "LinkHlth");
     if (loraSniffer) printSniff("LinkHealthRecord", packetSize, LoRa.packetRssi(), LoRa.packetSnr(), NULL, 0, lh.serialnumberarray, lhOk, NAN, NAN);
   } else if (packetSize == sizeof(LinkAckRecord)) {
@@ -1395,7 +1436,8 @@ void showHeard() {
   relayTickerShowing = relayOn && relayTickerAt && millis() - relayTickerAt < RELAY_TICKER_MS;
   if (relayTickerShowing) {
     // relay ticker: the last packet Paula resent, e.g. "> Chinampa relayed"
-    snprintf(line, sizeof(line), "> %.10s relayed", relayTickerName);
+    if (relayTickerAction == RELAY_TICK_STRONG) snprintf(line, sizeof(line), "%.8s strong %d", relayTickerName, relayTickerRssi);
+    else snprintf(line, sizeof(line), "> %.10s relayed", relayTickerName);
   } else {
     snprintf(line, sizeof(line), "%ddBm %02d:%02d:%02d", lastHeardRssi, currentTimerRecord.hour,
              currentTimerRecord.minute, currentTimerRecord.second);
@@ -1750,6 +1792,16 @@ void loop() {
       relayQueue[relayJustQueued].name[sizeof(relayQueue[relayJustQueued].name) - 1] = 0;
       relayJustQueued = -1;
     }
+    if (relayPendingStrong) {  // not relayed for being strong - on the ticker with the name just heard
+      strncpy(relayTickerName, lastHeardName, sizeof(relayTickerName) - 1);
+      relayTickerName[sizeof(relayTickerName) - 1] = 0;
+      relayTickerAction = RELAY_TICK_STRONG;
+      relayTickerRssi = relayPendingStrongRssi;
+      relayTickerAt = millis();
+      if (!relayTickerAt) relayTickerAt = 1;
+      relayPendingStrong = false;
+      lastHeardNew = true;
+    }
     packetShowUntil = millis() + PACKET_SHOW_MS;  // the packet light show - see showStatusGlyphs
     bool show = false;
     currentPalette = RainbowStripeColors_p;
@@ -2057,6 +2109,7 @@ void loop() {
         "GetNearbyDevices            devices heard over LoRa",
         "GetNearbyPacket#<serial>    last packet from a device + layout check",
         "Relay#1 / Relay#0 / Relay   relay mode on/off/status",
+        "Relay#1#<dBm>               relay on, skip packets heard at <dBm> or stronger (0 = relay all)",
         "GetNoise                    channel noise level here",
         "GetSensorData / AsyncData / GetLifeCycleData / GetWPSSensorData",
         "GetIpAddress / IPAddr / SSID / RestartWifi / DeviceWifi",
@@ -2242,6 +2295,14 @@ void loop() {
       if (arg.length()) {
         relayOn = arg.toInt() > 0;
         if (!relayOn) for (int i = 0; i < RELAY_QUEUE; i++) relayQueue[i].len = 0;
+      }
+      // Relay#1#<dBm>: the strong-signal limit (2026-11-11) - packets at or above it are not relayed;
+      // 0 = relay everything. -120..-1 accepted.
+      String limit = generalFunctions.getValue(command, '#', 2);
+      limit.trim();
+      if (limit.length()) {
+        int v = limit.toInt();
+        if (v == 0 || (v >= -120 && v < 0)) relayStrongDbm = v;
       }
       Serial.print("RELAY ");
       printRelayJson();
