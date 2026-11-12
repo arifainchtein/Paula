@@ -70,7 +70,9 @@ bool inPulse=false;
 //      the packet rainbow on the middle row only - V50 sagged to 3.96 V and the OLED blanked.
 // 13 = 2026-11-11: Annabelle's forecast accepted - its code is checked against the time Annabelle stamped
 //      on it (annabelleTime), as Langley/Daffodil do; checking against Paula's clock rejected every one.
-const int firmwareVersion = 13;
+// 14 = 2026-11-12: flow test captures for 10 s (was 5) and reports pulses / Hz / L/min, with its Ok- line
+//      after the sequence so PaulaDeployer receives the count.
+const int firmwareVersion = 14;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
