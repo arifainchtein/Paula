@@ -166,7 +166,7 @@ DataManager dataManager(Serial, LittleFS);
 
 #define LED_PIN 19
 // Paula shield (Daffodil hardware) has 15 physical LEDs - the flow calibration countdown
-// (runFlowCalibrationLedSequence) needs all 15 for its 15s red / 5s green sequence.
+// (runFlowCalibrationLedSequence) needs all 15 for its 15s red countdown (then 10s green).
 #define NUM_LEDS 15
 #define STALE_INTERVAL 20
 #define WEATHER_STALE_INTERVAL 7200
@@ -1671,13 +1671,15 @@ bool isSentByArraySet(uint8_t* arr, size_t size) {
 // Phase 1 (red, 15s): one LED lights per second, all 15 - gives the operator time to walk to the
 // sensor and position the collection container. No pulses counted yet - water may already be
 // running but isn't being captured into anything measurable.
-// Phase 2 (green, 5s): one of the first 5 LEDs lights per second - the operator should be
+// Phase 2 (green, 10s): one of the first 10 LEDs lights per second - the operator should be
 // actively catching water now. Pulses ARE counted during exactly this window, nothing before or
-// after it.
+// after it. 10s, not 5 (2026-11-12): with a sensor already inline there is no water to catch, and
+// the pulse count over a fixed 10s is the test itself (pulses/10 = Hz = Q factor x L/min).
 // Returns the pulse count captured during phase 2. A 0 with water confirmed running is itself a
 // useful field diagnostic - the sensor (or its wiring) likely isn't producing pulses at all,
 // independent of whatever qfactor math would otherwise follow.
-unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, volatile unsigned long &pulseCounter) {
+#define FLOW_CAPTURE_SECONDS 10
+unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, volatile unsigned long &pulseCounter, float qfactor) {
   uint8_t savedBrightness = NORMAL_BRIGHTNESS;  // Paula's normal LED brightness, set once in setup()
   FastLED.setBrightness(255);
 
@@ -1696,8 +1698,8 @@ unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, vola
 
   pulseCounter = 0;
   calibratingFlag = true;
-  Serial.println("Phase 2/2: GREEN capture window, 5s - catch water now.");
-  for (uint8_t i = 0; i < 5; i++) {
+  Serial.println("Phase 2/2: GREEN capture window, " + String(FLOW_CAPTURE_SECONDS) + "s - catch water now.");
+  for (uint8_t i = 0; i < FLOW_CAPTURE_SECONDS; i++) {
     leds[i] = CRGB(0, 255, 0);
     FastLED.show();
     delay(1000);
@@ -1709,7 +1711,14 @@ unsigned long runFlowCalibrationLedSequence(volatile bool &calibratingFlag, vola
   FastLED.setBrightness(savedBrightness);
 
   unsigned long captured = pulseCounter;
-  Serial.println("Capture window complete - pulses=" + String(captured) + (captured == 0 ? " (0 pulses with water running suggests a bad sensor or connection, not a qfactor problem)" : " - measure the water you just caught, then send the Stop command with that volume in mL"));
+  float hz = captured / (float)FLOW_CAPTURE_SECONDS;
+  Serial.println("Capture window complete - pulses=" + String(captured) + " in " + String(FLOW_CAPTURE_SECONDS) + "s (" + String(hz, 1) + " Hz, " + String((unsigned long)(hz * 60)) + " pulses/min)");
+  if (captured == 0) {
+    Serial.println("0 pulses with water running suggests a bad sensor or connection, not a qfactor problem");
+  } else {
+    if (qfactor > 0) Serial.println("At the current qfactor " + String(qfactor, 2) + " that is " + String(hz / qfactor, 2) + " L/min");
+    Serial.println("If you caught the water, send the Stop command with its volume in mL for a new qfactor");
+  }
   return captured;
 }
 
@@ -2451,14 +2460,15 @@ void loop() {
         Serial.println("Failure-CalibrateFlowSensor1Start-not in Flow mode (send SetTestMode#Flow first - pin 18 is currently set up for ultrasonic UART)");
         Serial.flush();
       } else {
-      // One-person field test: turn the water on FIRST, then send this. It blocks for ~20s
+      // One-person field test: turn the water on FIRST, then send this. It blocks for ~25s
       // running the LED-guided countdown/capture sequence (see runFlowCalibrationLedSequence's
       // comment) - no need to be at the console during that window, the LEDs do the timing.
       // Once it returns, measure the water you caught during the green phase and send
       // CalibrateFlowSensor1Stop#<measuredMilliLitres>.
+      // Ok- after the sequence, not before (2026-11-12): PaulaDeployer returns at the Ok- line, so
+      // printing it first lost the pulse count that comes ~25s later.
+      runFlowCalibrationLedSequence(calibratingFlow1, calibrationPulseCount1, digitalStablesData.qfactor1);
       Serial.println("Ok-CalibrateFlowSensor1Start");
-      Serial.flush();
-      runFlowCalibrationLedSequence(calibratingFlow1, calibrationPulseCount1);
       Serial.flush();
       }
     } else if (command.startsWith("CalibrateFlowSensor1Stop")) {
@@ -2477,9 +2487,10 @@ void loop() {
       }
       Serial.flush();
     } else if (command.startsWith("CalibrateFlowSensor2Start")) {
+      // Ok- after the sequence, not before (2026-11-12): PaulaDeployer returns at the Ok- line, so
+      // printing it first lost the pulse count that comes ~25s later.
+      runFlowCalibrationLedSequence(calibratingFlow2, calibrationPulseCount2, digitalStablesData.qfactor2);
       Serial.println("Ok-CalibrateFlowSensor2Start");
-      Serial.flush();
-      runFlowCalibrationLedSequence(calibratingFlow2, calibrationPulseCount2);
       Serial.flush();
     } else if (command.startsWith("CalibrateFlowSensor2Stop")) {
       calibratingFlow2 = false;
