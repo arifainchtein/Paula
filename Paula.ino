@@ -72,7 +72,9 @@ bool inPulse=false;
 //      on it (annabelleTime), as Langley/Daffodil do; checking against Paula's clock rejected every one.
 // 14 = 2026-11-12: flow test captures for 10 s (was 5) and reports pulses / Hz / L/min, with its Ok- line
 //      after the sequence so PaulaDeployer receives the count.
-const int firmwareVersion = 14;
+// 15 = 2026-11-23: DevicePause#<serial>#clear - ends a Chinampa system pause over LoRa (DEVICE_COMMAND_CLEAR_PAUSE);
+//      DevicePause#<serial>#test - asks it for a test alert (code 14, 5 min, the pump keeps running).
+const int firmwareVersion = 15;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -1048,6 +1050,8 @@ void processLora(int packetSize) {
     chinampaData.rssi = LoRa.packetRssi();
     chinampaData.snr = LoRa.packetSnr();
     noteNearbyChinampa(chinampaData);
+    // a ClearPause from PaulaDeployer is done once Chinampa reports no pause (DeviceCommandQueue::notePauseState)
+    deviceCommandQueue.notePauseState(chinampaData.serialnumberarray, chinampaData.alertcode, millis());
     noteHeard(chinampaData.devicename, sizeof(chinampaData.devicename), NULL, "Chinampa");
     if (loraSniffer) printSniff("ChinampaData", packetSize, chinampaData.rssi, chinampaData.snr, chinampaData.devicename, sizeof(chinampaData.devicename), chinampaData.serialnumberarray, -1, chinampaData.latitude, chinampaData.longitude);
     //if(debug)
@@ -2346,6 +2350,27 @@ void loop() {
       serialHex.toUpperCase();
       if (printNearbyPacket(serialHex)) Serial.println("Ok-GetNearbyPacket");
       else Serial.println("Failure-GetNearbyPacket-not heard");
+      Serial.flush();
+    } else if (command.startsWith("DevicePause")) {
+      // DevicePause#<Chinampa serial, 16 hex digits>#clear (2026-11-23): end a Chinampa system pause (alerts
+      // 11/12/13) over LoRa - DEVICE_COMMAND_CLEAR_PAUSE, resent until Chinampa's records show no pause.
+      String sn = generalFunctions.getValue(command, '#', 1);
+      String state = generalFunctions.getValue(command, '#', 2);
+      state.trim();
+      uint8_t serial[8];
+      bool valid = sn.length() == 16 && (state == "clear" || state == "test");
+      for (int i = 0; valid && i < 8; i++) {
+        char hex[3] = { sn[i * 2], sn[i * 2 + 1], 0 };
+        char *end;
+        serial[i] = (uint8_t)strtoul(hex, &end, 16);
+        valid = *end == 0;
+      }
+      if (valid) {
+        deviceCommandQueue.request(serial, state == "test" ? DEVICE_COMMAND_TEST_ALERT : DEVICE_COMMAND_CLEAR_PAUSE, 0, millis());
+        Serial.println("Ok-DevicePause");
+      } else {
+        Serial.println("Failure-DevicePause: expected DevicePause#<16 hex digits>#clear|test");
+      }
       Serial.flush();
     } else if (command.startsWith("DeviceWifi")) {
       // DeviceWifi#<serial, 16 hex digits>#on|off - PaulaDeployer's Nearby devices button
