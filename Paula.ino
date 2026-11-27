@@ -81,7 +81,9 @@ bool inPulse=false;
 //      GetCommandCode: always the 6-digit code (it printed nothing when the code was >= 100000), on real UTC
 //      (rtcUtcEpoch, as Annabelle - it was local-as-UTC, which Annabelle's VerifyUserCode refuses), then
 //      Ok-GetCommandCode. PaulaDeployer sends it with each field packet to the Teleonome.
-const int firmwareVersion = 17;
+// 18 = 2026-11-27: FindSoil#from#to - PaulaDeployer's "Find Probe" (the probe on Ari's bench was on 10, not 2).
+//      GetTime also prints utcTime= (rtcUtcEpoch), read by PaulaDeployer's Soil Test clock line.
+const int firmwareVersion = 18;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -608,8 +610,10 @@ void readClipsal() {
 // the request and the reply (~0.5 s, up to 3 tries), then Wire.begin() again before it answers - the OLED,
 // RTC, ADS1115 and INA228 only miss that half second, and loop() needs no changes. Between reads SCL idles
 // high, so DE is high and the MAX485E drives an idle bus - harmless, the probe only talks when asked.
-// Clipsall board fix needed (measured on Gloria): bridge R2 (10k RO -> RX) or the shifter's 10k to V50
-// holds RX at ~2.4 V and nothing is received.
+// Clipsall board fixes needed: bridge R2 (10k RO -> RX) or the shifter's 10k to V50 holds RX at ~2.4 V and
+// nothing is received (measured on Gloria); and REMOVE R1 (10k DE -> GND): DE is on SCL here, and R1 against the
+// I2C pull-up holds SCL too low for I2C, so the RTC (clock set/read), OLED, ADS1115 and INA228 all fail while the
+// board is connected (found 2026-11-27 on Paula: Set Paula's clock worked again with DE disconnected).
 // The 18/33 flow interrupts stay off until StopSoil (or StopClipsal / SetTestMode#Flow).
 // Same register decode as ModbusSensorBus's "soil7" driver; no scanning or auto-addressing, so a test
 // probe keeps its address.
@@ -650,7 +654,8 @@ void endSoil() {
 }
 
 // One request/reply. Returns 0 ok, 1 no reply, 2 garbled, 3 exception. Called with GPIO22 already ours.
-static int soilTransaction(uint8_t addr, uint16_t *regs, bool &echo, uint8_t &exceptionCode) {
+static int soilTransaction(uint8_t addr, uint16_t *regs, bool &echo, uint8_t &exceptionCode,
+                           uint16_t timeoutMs = SOIL_REPLY_TIMEOUT_MS) {
   uint8_t req[8] = { addr, 0x03, 0x00, 0x00, 0x00, 0x08, 0, 0 };
   uint16_t crc = soilCrc16(req, 6);
   req[6] = crc & 0xFF;
@@ -667,7 +672,7 @@ static int soilTransaction(uint8_t addr, uint16_t *regs, bool &echo, uint8_t &ex
   uint8_t buf[64];
   uint8_t len = 0;
   unsigned long start = millis(), last = start;
-  while (millis() - start < SOIL_REPLY_TIMEOUT_MS && !(len > 0 && millis() - last > 20)) {
+  while (millis() - start < timeoutMs && !(len > 0 && millis() - last > 20)) {
     while (ultrasonicSerial2.available() && len < sizeof(buf)) {
       buf[len++] = ultrasonicSerial2.read();
       last = millis();
@@ -736,6 +741,37 @@ void readSoil(uint8_t addr) {
           + " bad=" + String(soilBad) + " noReply=" + String(soilNoReply) + " good=" + String(soilOkCount);
   Serial.println(line);
   Serial.println("Ok-ReadSoil");
+  Serial.flush();
+}
+
+// FindSoil#from#to (v18, 2026-11-27): PaulaDeployer's "Find Probe" - asks every address in from..to once for the
+// probe's registers (150 ms each, 60 ms gap: 32 addresses in ~7 s) and lists the ones that answered at all, a good
+// reply or a Modbus exception from that address ("found=10" or "found=10,11"; "found=" none). SCL is borrowed
+// from I2C once for the whole range. Garbled replies don't count (they can't say who sent them) but are counted.
+// Probes leave the factory on 2 (or 1); Gloria's ModbusSensorBus moves the ones it finds to 10 and up.
+void findSoil(int from, int to) {
+  startSoil();
+  Wire.end();
+  pinMode(SOIL_DE_PIN, OUTPUT);
+  digitalWrite(SOIL_DE_PIN, LOW);
+  String found = "";
+  uint32_t badBefore = soilBad;
+  int echoes = 0;
+  for (int a = from; a <= to; a++) {
+    uint16_t regs[8];
+    bool echo = false;
+    uint8_t exceptionCode = 0;
+    uint32_t bad = soilBad;
+    int r = soilTransaction((uint8_t)a, regs, echo, exceptionCode, 150);
+    if (echo) echoes++;
+    if (r == 0 || r == 3) found += (found.length() ? "," : "") + String(a);
+    if (r == 3) soilBad = bad;  // an exception from the right address is an answer, not a bad reply
+    delay(60);
+  }
+  Wire.begin();
+  Serial.println("found=" + found + " from=" + String(from) + " to=" + String(to) + " echoes=" + String(echoes)
+                 + " garbled=" + String(soilBad - badBefore));
+  Serial.println("Ok-FindSoil");
   Serial.flush();
 }
 
@@ -2318,6 +2354,7 @@ void loop() {
         "SetStatusText / GetSwitchState / SetTestMode",
         "GetUltrasonicReading / ReadClipsal / ReadClipsal2US / StopClipsal / ReadVoltageMonitor",
         "ReadSoil[#addr] / StopSoil   RS485 7-in-1 soil probe (TX 18, RX 33, DE = SCL)",
+        "FindSoil#from#to            which RS485 addresses answer (at most 48 at a time)",
         "TestI2CTemperatureSensor / TestTankPressureSensor1 / TestTankPressureSensor2",
         "CalibrateFlowSensor1Start / CalibrateFlowSensor1Stop#<ml> (and 2)",
         "PulseStart / PulseFinished / SetFieldId",
@@ -2334,6 +2371,7 @@ void loop() {
       // for an Ok-/Failure- line and showed nothing without it
       Serial.println();
       Serial.println("codeTime=" + String(timeManager.getTimeForCodeGeneration()));
+      Serial.println("utcTime=" + String((long)rtcUtcEpoch()));  // v18: the clock GetCommandCode's codes come from
       Serial.println("Ok-GetTime");
       Serial.flush();
     } else if (command.startsWith("GetCommandCode")) {
@@ -2608,6 +2646,15 @@ void loop() {
         Serial.flush();
       } else {
         readSoil((uint8_t)addr);
+      }
+    } else if (command.startsWith("FindSoil")) {
+      int from = generalFunctions.getValue(command, '#', 1).toInt();
+      int to = generalFunctions.getValue(command, '#', 2).toInt();
+      if (from < 1 || to > 247 || from > to || to - from > 47) {
+        Serial.println("Failure-FindSoil-use FindSoil#from#to, 1-247, at most 48 addresses at a time");
+        Serial.flush();
+      } else {
+        findSoil(from, to);
       }
     } else if (command.startsWith("StopSoil")) {
       endSoil();
