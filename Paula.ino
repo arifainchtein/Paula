@@ -23,6 +23,7 @@
 #include "ADS1X15.h"
 #include "OneWire.h"
 #include "DallasTemperature.h"
+#include <ModbusSensorBus.h>  // only for MODBUS_SENSOR_DRIVERS (the soil probe's decode), see readSoil
 bool gloriaTankFlowPumpNewData = false;
 bool digitalStablesDataNewData = false;
 bool chinampaDataNewData = false;
@@ -74,7 +75,13 @@ bool inPulse=false;
 //      after the sequence so PaulaDeployer receives the count.
 // 15 = 2026-11-23: DevicePause#<serial>#clear - ends a Chinampa system pause over LoRa (DEVICE_COMMAND_CLEAR_PAUSE);
 //      DevicePause#<serial>#test - asks it for a test alert (code 14, 5 min, the pump keeps running).
-const int firmwareVersion = 15;
+// 16 = 2026-11-23: GetTime and SetTime end with Ok-GetTime / Ok-SetTime (PaulaDeployer showed nothing for GetTime).
+// 17 = 2026-11-27: ReadSoil[#addr] / StopSoil - PaulaDeployer's "Test Soil Sensor": a 7-in-1 RS485 soil probe
+//      through a Clipsall RS485 board (TX 18, RX 33, DE on SCL/GPIO22 borrowed from I2C during each read).
+//      GetCommandCode: always the 6-digit code (it printed nothing when the code was >= 100000), on real UTC
+//      (rtcUtcEpoch, as Annabelle - it was local-as-UTC, which Annabelle's VerifyUserCode refuses), then
+//      Ok-GetCommandCode. PaulaDeployer sends it with each field packet to the Teleonome.
+const int firmwareVersion = 17;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 static volatile int flowMeterPulseCount;
@@ -588,6 +595,167 @@ void readClipsal() {
                  + " tempProbes=" + String(probes));
   Serial.println("Ok-ReadClipsal");
   Serial.flush();
+}
+
+// "Test Soil Sensor" (2026-11-27, PaulaDeployer's yellow button): a 7-in-1 RS485 soil probe (address 2,
+// 9600 8N1, function 03 registers 0-7) through the Clipsall RS485 board (HardwareDesign/
+// ClipsallJunctionBoxWaterTrough_RS485, MAX485E, J2 = RX / DE / TX, ~RE tied to GND so it hears its own
+// request first). Paula's Daffodil shield has only the two sensor terminals, so:
+//   TX = pin 18 terminal, RX = pin 33 terminal (both through the 2N7002 shifters, jumpers on DIGITAL),
+//   DE = SCL (GPIO22) on the I2C terminal - SCL, not SDA: SCL held low only freezes the bus, SDA low while
+//        SCL is high is a START.
+// DE must be LOW to receive and I2C idles HIGH, so each ReadSoil does Wire.end(), drives GPIO22 itself for
+// the request and the reply (~0.5 s, up to 3 tries), then Wire.begin() again before it answers - the OLED,
+// RTC, ADS1115 and INA228 only miss that half second, and loop() needs no changes. Between reads SCL idles
+// high, so DE is high and the MAX485E drives an idle bus - harmless, the probe only talks when asked.
+// Clipsall board fix needed (measured on Gloria): bridge R2 (10k RO -> RX) or the shifter's 10k to V50
+// holds RX at ~2.4 V and nothing is received.
+// The 18/33 flow interrupts stay off until StopSoil (or StopClipsal / SetTestMode#Flow).
+// Same register decode as ModbusSensorBus's "soil7" driver; no scanning or auto-addressing, so a test
+// probe keeps its address.
+#define SOIL_DE_PIN 22
+#define SOIL_REPLY_TIMEOUT_MS 300
+#define SOIL_TRIES 3
+bool soilActive = false;
+uint32_t soilSent = 0, soilEchoes = 0, soilBad = 0, soilNoReply = 0, soilOkCount = 0;
+
+static uint16_t soilCrc16(const uint8_t *d, size_t n) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < n; i++) {
+    crc ^= d[i];
+    for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  }
+  return crc;
+}
+
+void startSoil() {
+  if (soilActive) return;
+  startFlowMode();  // pin 18's ultrasonic UART (UART2) off
+  endClipsal();     // pin 33 back from OneWire / UART1
+  detachInterrupt(SENSOR_INPUT_1);
+  detachInterrupt(SENSOR_INPUT_2);
+  ultrasonicSerial2.begin(9600, SERIAL_8N1, SENSOR_INPUT_2, SENSOR_INPUT_1);  // UART1: RX 33, TX 18
+  soilSent = soilEchoes = soilBad = soilNoReply = soilOkCount = 0;
+  soilActive = true;
+}
+
+void endSoil() {
+  if (!soilActive) return;
+  ultrasonicSerial2.end();
+  pinMode(SENSOR_INPUT_1, INPUT);
+  pinMode(SENSOR_INPUT_2, INPUT);
+  attachInterrupt(SENSOR_INPUT_1, pulseCounter, FALLING);
+  attachInterrupt(SENSOR_INPUT_2, pulseCounter2, FALLING);
+  soilActive = false;
+}
+
+// One request/reply. Returns 0 ok, 1 no reply, 2 garbled, 3 exception. Called with GPIO22 already ours.
+static int soilTransaction(uint8_t addr, uint16_t *regs, bool &echo, uint8_t &exceptionCode) {
+  uint8_t req[8] = { addr, 0x03, 0x00, 0x00, 0x00, 0x08, 0, 0 };
+  uint16_t crc = soilCrc16(req, 6);
+  req[6] = crc & 0xFF;
+  req[7] = crc >> 8;
+  while (ultrasonicSerial2.available()) ultrasonicSerial2.read();
+  digitalWrite(SOIL_DE_PIN, HIGH);
+  delayMicroseconds(100);
+  ultrasonicSerial2.write(req, 8);
+  ultrasonicSerial2.flush();
+  delayMicroseconds(200);
+  digitalWrite(SOIL_DE_PIN, LOW);
+  soilSent++;
+
+  uint8_t buf[64];
+  uint8_t len = 0;
+  unsigned long start = millis(), last = start;
+  while (millis() - start < SOIL_REPLY_TIMEOUT_MS && !(len > 0 && millis() - last > 20)) {
+    while (ultrasonicSerial2.available() && len < sizeof(buf)) {
+      buf[len++] = ultrasonicSerial2.read();
+      last = millis();
+    }
+    delay(1);
+  }
+  echo = len >= 8 && memcmp(buf, req, 8) == 0;
+  uint8_t *p = buf + (echo ? 8 : 0);
+  uint8_t pl = len - (echo ? 8 : 0);
+  if (echo) soilEchoes++;
+  if (pl == 0) { soilNoReply++; return 1; }
+  if (pl >= 5 && p[0] == addr && p[1] == 0x83 && soilCrc16(p, 3) == (uint16_t)(p[3] | (p[4] << 8))) {
+    exceptionCode = p[2];
+    soilBad++;
+    return 3;
+  }
+  if (pl < 21 || p[0] != addr || p[1] != 0x03 || p[2] != 16 || soilCrc16(p, 19) != (uint16_t)(p[19] | (p[20] << 8))) {
+    soilBad++;
+    return 2;
+  }
+  for (int i = 0; i < 8; i++) regs[i] = (p[3 + 2 * i] << 8) | p[4 + 2 * i];
+  return 0;
+}
+
+// ReadSoil[#addr] -> one line "soilOk=1 addr=2 moist=.. temp=.. ph=.. ec=.. n=.. p=.. k=.. salt=.. raw=r0,..,r7
+// result=ok tries=1 sent=.. echoes=.. bad=.. noReply=.." then Ok-ReadSoil. soilOk=0 still answers Ok-ReadSoil,
+// with result= saying why (noReply / garbled / exception<code> / implausible), so the page can show it.
+// echoes=0 with noReply: TX / DE / RX wiring or the board's power. Echo on every try but no reply: the A/B
+// side (swapped, probe power, wrong address or baud).
+void readSoil(uint8_t addr) {
+  startSoil();
+  int driver = -1;
+  for (uint8_t i = 0; i < MODBUS_SENSOR_DRIVER_COUNT; i++) {
+    if (strcmp(MODBUS_SENSOR_DRIVERS[i].id, "soil7") == 0) driver = i;
+  }
+
+  Wire.end();
+  pinMode(SOIL_DE_PIN, OUTPUT);
+  digitalWrite(SOIL_DE_PIN, LOW);
+  uint16_t regs[8] = { 0 };
+  int result = 1, tries = 0;
+  bool echo = false;
+  uint8_t exceptionCode = 0;
+  while (tries < SOIL_TRIES) {
+    tries++;
+    result = soilTransaction(addr, regs, echo, exceptionCode);
+    if (result == 0) break;
+    delay(60);  // gap between requests, as ModbusSensorBus
+  }
+  Wire.begin();  // SCL back to I2C
+
+  float values[MSB_MAX_VALUES];
+  bool plausible = result == 0 && driver >= 0 && MODBUS_SENSOR_DRIVERS[driver].decode(regs, values);
+  if (plausible) soilOkCount++;
+  String line = "soilOk=" + String(plausible ? 1 : 0) + " addr=" + String(addr);
+  if (plausible) {
+    const ModbusSensorDriver &d = MODBUS_SENSOR_DRIVERS[driver];
+    for (uint8_t i = 0; i < d.valueCount; i++) line += " " + String(d.values[i].id) + "=" + String(values[i], (unsigned int)d.values[i].decimals);
+  }
+  if (result == 0 || result == 3) {
+    line += " raw=";
+    for (int i = 0; i < 8; i++) line += (i ? "," : "") + String(regs[i]);
+  }
+  line += " result=" + String(result == 0 ? (plausible ? "ok" : "implausible") : result == 1 ? "noReply" : result == 2 ? "garbled" : ("exception" + String(exceptionCode)).c_str());
+  line += " tries=" + String(tries) + " echo=" + String(echo ? 1 : 0) + " sent=" + String(soilSent) + " echoes=" + String(soilEchoes)
+          + " bad=" + String(soilBad) + " noReply=" + String(soilNoReply) + " good=" + String(soilOkCount);
+  Serial.println(line);
+  Serial.println("Ok-ReadSoil");
+  Serial.flush();
+}
+
+// Real UTC from the RTC, which keeps local wall-clock time (2026-11-27, copied from Annabelle's rtcUtcEpoch()).
+// GetCommandCode uses it so its code is the one Annabelle's VerifyUserCode accepts (real UTC, like the
+// authenticator app) - the Teleonome's Field Packet Receiver checks PaulaDeployer's packets that way. The LoRa
+// codes (WeatherForecastUpdate etc.) stay on the local-as-UTC base the field devices use.
+time_t rtcUtcEpoch() {
+  RTCInfoRecord r = timeManager.now();
+  setenv("TZ", timezone.c_str(), 1);
+  tzset();
+  struct tm rtc = {};
+  rtc.tm_year = r.year - 1900;
+  rtc.tm_mon = r.month - 1;
+  rtc.tm_mday = r.date;
+  rtc.tm_hour = r.hour;
+  rtc.tm_min = r.minute;
+  rtc.tm_sec = r.second;
+  rtc.tm_isdst = -1;
+  return mktime(&rtc);
 }
 
 void onReceive(int packetSize) {
@@ -1191,7 +1359,9 @@ void processLora(int packetSize) {
 
 
 // Pin 18 as the DYP-A02's UART RX (see ultrasonicSerial) / back to Flow Sensor 1's interrupt.
+void endSoil();
 void startUltrasonicMode() {
+  endSoil();  // the soil test had pin 18 as UART1 TX (2026-11-27)
   detachInterrupt(SENSOR_INPUT_1);
   ultrasonicFrameBufLen = 0;
   lastUltrasonicDistanceMM = 0;
@@ -2048,6 +2218,9 @@ void loop() {
     if (command.startsWith("SetTime")) {
       //SetTime#8#5#24#4#18#22#25
         timeManager.setTime(command);
+        Serial.println();
+        Serial.println("Ok-SetTime");  // 2026-11-23: PaulaDeployer's Set Time looks for it
+        Serial.flush();
       
     }else if(command.startsWith("debug")){
       int debugv = generalFunctions.getValue(command, '#', 1).toInt();
@@ -2144,6 +2317,7 @@ void loop() {
         "GetCommandCode / VerifyUserCode / GetSecret / SetSecret",
         "SetStatusText / GetSwitchState / SetTestMode",
         "GetUltrasonicReading / ReadClipsal / ReadClipsal2US / StopClipsal / ReadVoltageMonitor",
+        "ReadSoil[#addr] / StopSoil   RS485 7-in-1 soil probe (TX 18, RX 33, DE = SCL)",
         "TestI2CTemperatureSensor / TestTankPressureSensor1 / TestTankPressureSensor2",
         "CalibrateFlowSensor1Start / CalibrateFlowSensor1Stop#<ml> (and 2)",
         "PulseStart / PulseFinished / SetFieldId",
@@ -2156,19 +2330,21 @@ void loop() {
       Serial.println(F("Ok-GetFirmware"));
     } else if (command.startsWith("GetTime")) {
       timeManager.printTimeToSerial(currentTimerRecord);
-      Serial.flush();
+      // 2026-11-23: the time and the code time on their own line, then Ok- - PaulaDeployer's Send Command waits
+      // for an Ok-/Failure- line and showed nothing without it
+      Serial.println();
+      Serial.println("codeTime=" + String(timeManager.getTimeForCodeGeneration()));
+      Serial.println("Ok-GetTime");
       Serial.flush();
     } else if (command.startsWith("GetCommandCode")) {
-      long code = secretManager.generateCode();
-      //
-      // patch a bug in the totp library
-      // if the first digit is a zero, it
-      // returns a 5 digit number
-      if (code < 100000) {
-        Serial.print("0");
-        Serial.println(code);
-      }
-
+      long code = secretManager.generateCodeAt((long)rtcUtcEpoch());  // real UTC, as Annabelle's VerifyUserCode
+      // Always 6 digits, zero-padded (the totp library returns 5 digits when the first is a zero). Before v17
+      // only codes below 100000 were printed at all - nine times in ten GetCommandCode answered nothing.
+      // 2026-11-27: then Ok-GetCommandCode, so PaulaDeployer's field packet sender knows the answer is complete.
+      char codeText[12];
+      snprintf(codeText, sizeof(codeText), "%06ld", code);
+      Serial.println(codeText);
+      Serial.println("Ok-GetCommandCode");
       Serial.flush();
       // // delay(delayTime);
     }else if (command.startsWith("VerifyUserCode")) {
@@ -2410,6 +2586,7 @@ void loop() {
         if (currentTestMode != TEST_MODE_ULTRASONIC) startUltrasonicMode();
         Serial.println("Ok-SetTestMode-Ultrasonic");
       } else if (mode == "Flow") {
+        endSoil();
         startFlowMode();
         endClipsal();
         Serial.println("Ok-SetTestMode-Flow");
@@ -2423,7 +2600,21 @@ void loop() {
       readClipsal2US();
     } else if (command.startsWith("ReadClipsal")) {
       readClipsal();
+    } else if (command.startsWith("ReadSoil")) {
+      String a = generalFunctions.getValue(command, '#', 1);
+      int addr = a.length() ? a.toInt() : 2;
+      if (addr < 1 || addr > 247) {
+        Serial.println("Failure-ReadSoil-address must be 1-247");
+        Serial.flush();
+      } else {
+        readSoil((uint8_t)addr);
+      }
+    } else if (command.startsWith("StopSoil")) {
+      endSoil();
+      Serial.println("Ok-StopSoil");
+      Serial.flush();
     } else if (command.startsWith("StopClipsal")) {
+      endSoil();
       startFlowMode();
       endClipsal();
       Serial.println("Ok-StopClipsal");
